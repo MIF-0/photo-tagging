@@ -1,11 +1,11 @@
 # photo-tagging
 
-A Rust CLI that iterates over JPEG photos and uses Gemini Vision to embed an IPTC/XMP title, caption, and up to 25 keywords — optimized for stock photography uploads (Shutterstock, Adobe Stock, Pixta, Getty).
+A Rust CLI that iterates over JPEG photos and uses a vision LLM (Google Gemini or Groq) to embed an IPTC/XMP title, caption, and up to 25 keywords — optimized for stock photography uploads (Shutterstock, Adobe Stock, Pixta, Getty, Pond5).
 
 ## Requirements
 
 - Rust (stable)
-- A Gemini API key
+- A Gemini API key **or** a Groq API key (whichever provider you pick)
 - **`exiftool`** on your `PATH` — used to write the IPTC and XMP fields back into the JPEG. The tool will fail with a clear error if it is missing.
 
 ### Installing exiftool on macOS
@@ -27,12 +27,22 @@ exiftool -ver
 Create a `.env` file in the project root:
 
 ```
-GEMINI_API_KEY=your-key-here
+# Which provider to use: "gemini" (default) or "groq".
+PROVIDER=gemini
+
+# --- Gemini (used when PROVIDER=gemini) ---
+GEMINI_API_KEY=your-gemini-key
 GEMINI_RATE_LIMIT_MS=2000
-# Optional — Gemini model name. Defaults to "gemini-2.5-flash-lite" (highest
-# free-tier quota). Use "gemini-2.5-flash" for better quality, or
-# "gemini-3-flash" / preview models if you've enabled billing.
+# Optional — Gemini model name. Defaults to "gemini-2.5-flash-lite".
 GEMINI_MODEL=gemini-2.5-flash-lite
+
+# --- Groq (used when PROVIDER=groq) ---
+GROQ_API_KEY=your-groq-key
+GROQ_RATE_LIMIT_MS=2000
+# Optional — Groq model id. Defaults to "meta-llama/llama-4-scout-17b-16e-instruct".
+# See https://console.groq.com/ for the current list of vision-capable models.
+GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct
+
 # Optional — defaults to ./photo_tagger.log in the current working directory.
 LOG_FILE=/path/to/photo_tagger.log
 
@@ -45,6 +55,10 @@ DEFAULT_COUNTRY=United Kingdom
 DEFAULT_CAMERA_MAKE=Panasonic
 DEFAULT_CAMERA_MODEL=DC-S5M2X
 ```
+
+## Providers
+
+`PROVIDER=gemini` (default) routes through the Google Gemini `generateContent` REST API. `PROVIDER=groq` routes through Groq's OpenAI-compatible `/openai/v1/chat/completions` endpoint at https://api.groq.com/. Each provider has its own API key, model, and rate-limit env var (see above), so you can keep both configured and flip between them by changing `PROVIDER`. The prompt, JSON parsing, and IPTC/XMP writing are shared — switching providers only changes the network call.
 
 ## Supported Gemini models
 
@@ -59,6 +73,10 @@ Any model exposed by the Gemini `generateContent` REST endpoint will work — se
 | `gemini-3-pro` *(if available)* | Highest quality. Paid only in practice.                                           |
 
 Hitting `429 RESOURCE_EXHAUSTED` usually means you've hit the **per-day** free-tier cap on the chosen model — switch to a lighter model (e.g. `gemini-2.5-flash-lite`) or enable billing on the Google AI Studio project.
+
+## Supported Groq models
+
+Set `GROQ_MODEL` to any vision-capable model id from the [Groq console model list](https://console.groq.com/docs/models). Common picks include the Llama 4 family (`meta-llama/llama-4-scout-17b-16e-instruct`, `meta-llama/llama-4-maverick-17b-128e-instruct`) and the earlier Llama 3.2 vision previews. Groq tends to have very generous free-tier RPM limits but lower context — fine for one-image-per-call tagging.
 
 ## Usage
 

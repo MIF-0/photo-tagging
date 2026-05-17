@@ -99,35 +99,109 @@ fn strip_markdown_fence(raw: &str) -> &str {
         .trim()
 }
 
-async fn query_gemini_vision(
+const PROMPT: &str = "Analyze this image for stock photography optimization. Provide:\n\
+                  1. A catchy, highly relevant Title (max 5-7 words).\n\
+                  2. A detailed Description/Caption (1-2 sentences describing the scene).\n\
+                  3. Up to 25 keywords strictly sorted in ORDER OF PRECEDECE (the most important, visible subjects must come first, followed by broader categories, with abstract moods at the very end).\n\
+                  STRICT RULE FOR KEYWORDS: Only include elements that are directly visible or explicitly factual to the scene. Do not guess locations (e.g., 'Tokyo'), seasons, or industries unless there is undeniable visual proof in the image. Avoid fluff.\n\
+                  You must return the response strictly as a JSON object with keys: 'title', 'description', and 'keywords'.\n\
+                  CRITICAL GETTY IMAGES CONSTRAINT: Every keyword must be a single, standalone word or a universally standard two-word term (e.g., 'digital tablet', 'golden retriever'). Avoid descriptive phrases, sentences, or action-statements in the keywords array. Keep them literal, concrete, and distinct.\n\
+                  You must return the response strictly as a JSON object with keys: 'title', 'description', and 'keywords'.";
+
+#[derive(Clone, Copy, Debug)]
+enum Provider {
+    Gemini,
+    Groq,
+}
+
+struct LlmConfig {
+    provider: Provider,
+    api_key: String,
+    model: String,
+    rate_limit_ms: u64,
+}
+
+fn load_llm_config() -> Result<LlmConfig, Box<dyn Error>> {
+    let provider_raw = env::var("PROVIDER").unwrap_or_else(|_| "gemini".to_string());
+    let provider = match provider_raw.trim().to_lowercase().as_str() {
+        "gemini" => Provider::Gemini,
+        "groq" => Provider::Groq,
+        other => {
+            return Err(format!(
+                "Unknown PROVIDER '{}'. Use 'gemini' or 'groq'.",
+                other
+            )
+            .into());
+        }
+    };
+
+    let (key_var, model_var, rate_var, default_model) = match provider {
+        Provider::Gemini => (
+            "GEMINI_API_KEY",
+            "GEMINI_MODEL",
+            "GEMINI_RATE_LIMIT_MS",
+            "gemini-2.5-flash-lite",
+        ),
+        Provider::Groq => (
+            "GROQ_API_KEY",
+            "GROQ_MODEL",
+            "GROQ_RATE_LIMIT_MS",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+        ),
+    };
+
+    let api_key = env::var(key_var)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| format!("{} is not set (env var or .env file).", key_var))?;
+
+    let model = env::var(model_var)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default_model.to_string());
+
+    let rate_limit_ms: u64 = env::var(rate_var)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000);
+
+    Ok(LlmConfig {
+        provider,
+        api_key,
+        model,
+        rate_limit_ms,
+    })
+}
+
+async fn query_vision(
     client: &reqwest::Client,
-    api_key: &str,
-    model: &str,
+    cfg: &LlmConfig,
     image_path: &Path,
 ) -> Result<StockMetadata, Box<dyn Error>> {
     let image_bytes = fs::read(image_path)?;
     let base64_image = STANDARD.encode(&image_bytes);
 
-    // let prompt = "Analyze this image for stock photography optimization. Provide:\n\
-    //               1. A catchy, highly relevant Title (max 5-7 words).\n\
-    //               2. A detailed Description/Caption (1-2 sentences describing the scene).\n\
-    //               3. Up to 25 keywords strictly sorted in ORDER OF PRECEDECE (the most important, visible subjects must come first, followed by broader categories, with abstract moods at the very end).\n\
-    //               STRICT RULE FOR KEYWORDS: Only include elements that are directly visible or explicitly factual to the scene. Do not guess locations (e.g., 'Tokyo'), seasons, or industries unless there is undeniable visual proof in the image. Avoid fluff.\n\
-    //               You must return the response strictly as a JSON object with keys: 'title', 'description', and 'keywords'.";
+    let raw_json = match cfg.provider {
+        Provider::Gemini => call_gemini(client, &cfg.api_key, &cfg.model, &base64_image).await?,
+        Provider::Groq => call_groq(client, &cfg.api_key, &cfg.model, &base64_image).await?,
+    };
 
-    let getty_images_improved_prompt = "Analyze this image for stock photography optimization. Provide:\n\
-                  1. A catchy, highly relevant Title (max 5-7 words).\n\
-                  2. A detailed Description/Caption (1-2 sentences describing the scene).\n\
-                  3. Up to 25 keywords strictly sorted in ORDER OF PRECEDECE (the most important, visible subjects must come first, followed by broader categories, with abstract moods at the very end).\n\
-                  STRICT RULE FOR KEYWORDS: Only include elements that are directly visible or explicitly factual to the scene. Do not guess locations (e.g., 'Tokyo'), seasons, or industries unless there is undeniable visual proof in the image. Avoid fluff.\n\
-                  You must return the response strictly as a JSON object with keys: 'title', 'description', and 'keywords'.
-                  CRITICAL GETTY IMAGES CONSTRAINT: Every keyword must be a single, standalone word or a universally standard two-word term (e.g., 'digital tablet', 'golden retriever'). Avoid descriptive phrases, sentences, or action-statements in the keywords array. Keep them literal, concrete, and distinct.\n\
-                  You must return the response strictly as a JSON object with keys: 'title', 'description', and 'keywords'.";
+    let clean = strip_markdown_fence(&raw_json);
+    serde_json::from_str::<StockMetadata>(clean).map_err(|e| {
+        format!("Failed to parse model JSON: {} (payload: {})", e, clean).into()
+    })
+}
 
+async fn call_gemini(
+    client: &reqwest::Client,
+    api_key: &str,
+    model: &str,
+    base64_image: &str,
+) -> Result<String, Box<dyn Error>> {
     let payload = json!({
         "contents": [{
             "parts": [
-                { "text": getty_images_improved_prompt },
+                { "text": PROMPT },
                 {
                     "inlineData": {
                         "mimeType": "image/jpeg",
@@ -147,34 +221,80 @@ async fn query_gemini_vision(
     );
 
     let response = client.post(&url).json(&payload).send().await?;
-
     if !response.status().is_success() {
         let status = response.status();
         let err_text = response.text().await.unwrap_or_default();
         return Err(format!("Gemini API error ({}): {}", status, err_text).into());
     }
 
-    let gemini_res: GeminiResponse = response.json().await?;
-    let candidate = gemini_res
+    let res: GeminiResponse = response.json().await?;
+    let part = res
         .candidates
         .into_iter()
         .next()
-        .ok_or("Gemini response contained no candidates")?;
-    let part = candidate
+        .ok_or("Gemini response contained no candidates")?
         .content
         .parts
         .into_iter()
         .next()
         .ok_or("Gemini response candidate contained no parts")?;
+    Ok(part.text)
+}
 
-    let clean_json = strip_markdown_fence(&part.text);
-    let metadata: StockMetadata = serde_json::from_str(clean_json).map_err(|e| {
-        format!(
-            "Failed to parse Gemini JSON: {} (payload: {})",
-            e, clean_json
-        )
-    })?;
-    Ok(metadata)
+#[derive(Deserialize, Debug)]
+struct GroqResponse {
+    choices: Vec<GroqChoice>,
+}
+
+#[derive(Deserialize, Debug)]
+struct GroqChoice {
+    message: GroqMessage,
+}
+
+#[derive(Deserialize, Debug)]
+struct GroqMessage {
+    content: String,
+}
+
+async fn call_groq(
+    client: &reqwest::Client,
+    api_key: &str,
+    model: &str,
+    base64_image: &str,
+) -> Result<String, Box<dyn Error>> {
+    let data_url = format!("data:image/jpeg;base64,{}", base64_image);
+    let payload = json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": PROMPT },
+                { "type": "image_url", "image_url": { "url": data_url } }
+            ]
+        }],
+        "response_format": { "type": "json_object" }
+    });
+
+    let response = client
+        .post("https://api.groq.com/openai/v1/chat/completions")
+        .bearer_auth(api_key)
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let err_text = response.text().await.unwrap_or_default();
+        return Err(format!("Groq API error ({}): {}", status, err_text).into());
+    }
+
+    let res: GroqResponse = response.json().await?;
+    let choice = res
+        .choices
+        .into_iter()
+        .next()
+        .ok_or("Groq response contained no choices")?;
+    Ok(choice.message.content)
 }
 
 #[derive(Default)]
@@ -349,23 +469,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let log_path = env::var("LOG_FILE").unwrap_or_else(|_| "photo_tagger.log".to_string());
     init_logging(Path::new(&log_path));
 
-    let api_key = match env::var("GEMINI_API_KEY") {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => {
-            warn_!("❌ GEMINI_API_KEY is not set (env var or .env file).");
+    let llm_cfg = match load_llm_config() {
+        Ok(c) => c,
+        Err(e) => {
+            warn_!("❌ {}", e);
             std::process::exit(1);
         }
     };
-
-    let rate_limit_ms: u64 = env::var("GEMINI_RATE_LIMIT_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2000);
-
-    let model = env::var("GEMINI_MODEL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "gemini-2.5-flash-lite".to_string());
 
     let extras = ExtraTags {
         country: Some(
@@ -413,8 +523,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     info!(
-        "⚙️  Found {} image target(s) to process. Model: {} | Log: {}",
-        total, model, log_path
+        "⚙️  Found {} image target(s) to process. Provider: {:?} | Model: {} | Log: {}",
+        total, llm_cfg.provider, llm_cfg.model, log_path
     );
 
     let client = reqwest::Client::builder()
@@ -429,7 +539,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             target_path.display()
         );
 
-        match query_gemini_vision(&client, &api_key, &model, target_path).await {
+        match query_vision(&client, &llm_cfg, target_path).await {
             Ok(metadata) => {
                 info!(
                     "   → title: {} | keywords: {}",
@@ -448,7 +558,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             Err(api_err) => {
                 warn_!(
-                    "❌ Gemini call failed for [{}]: {}",
+                    "❌ {:?} call failed for [{}]: {}",
+                    llm_cfg.provider,
                     target_path.display(),
                     api_err
                 );
@@ -456,7 +567,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         if idx + 1 < total {
-            sleep(Duration::from_millis(rate_limit_ms)).await;
+            sleep(Duration::from_millis(llm_cfg.rate_limit_ms)).await;
         }
     }
 

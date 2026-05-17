@@ -1,0 +1,5 @@
+2026-05-18T00:00:35.000+0100 [info] ⚙️  Found 1 image target(s) to process. Provider: Gemini | Model: gemini-2.5-flash-lite | Log: photo_tagger.log
+2026-05-18T00:00:35.003+0100 [info] [1/1] Processing: /tmp/test_photo.jpg
+2026-05-18T00:00:44.391+0100 [info]    → title: Misty Forest Lake in Autumn | keywords: 25
+2026-05-18T00:00:44.978+0100 [info] ✅ Embedded IPTC metadata.
+2026-05-18T00:00:44.978+0100 [info] 🎉 Done.
