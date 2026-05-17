@@ -58,17 +58,27 @@ async fn query_gemini_vision(
     let image_bytes = fs::read(image_path)?;
     let base64_image = STANDARD.encode(&image_bytes);
 
-    let prompt = "Analyze this image for stock photography optimization. Provide:\n\
+    // let prompt = "Analyze this image for stock photography optimization. Provide:\n\
+    //               1. A catchy, highly relevant Title (max 5-7 words).\n\
+    //               2. A detailed Description/Caption (1-2 sentences describing the scene).\n\
+    //               3. Up to 25 keywords strictly sorted in ORDER OF PRECEDECE (the most important, visible subjects must come first, followed by broader categories, with abstract moods at the very end).\n\
+    //               STRICT RULE FOR KEYWORDS: Only include elements that are directly visible or explicitly factual to the scene. Do not guess locations (e.g., 'Tokyo'), seasons, or industries unless there is undeniable visual proof in the image. Avoid fluff.\n\
+    //               You must return the response strictly as a JSON object with keys: 'title', 'description', and 'keywords'.";
+
+    let getty_images_improved_prompt = "Analyze this image for stock photography optimization. Provide:\n\
                   1. A catchy, highly relevant Title (max 5-7 words).\n\
                   2. A detailed Description/Caption (1-2 sentences describing the scene).\n\
                   3. Up to 25 keywords strictly sorted in ORDER OF PRECEDECE (the most important, visible subjects must come first, followed by broader categories, with abstract moods at the very end).\n\
                   STRICT RULE FOR KEYWORDS: Only include elements that are directly visible or explicitly factual to the scene. Do not guess locations (e.g., 'Tokyo'), seasons, or industries unless there is undeniable visual proof in the image. Avoid fluff.\n\
+                  You must return the response strictly as a JSON object with keys: 'title', 'description', and 'keywords'.
+                  CRITICAL GETTY IMAGES CONSTRAINT: Every keyword must be a single, standalone word or a universally standard two-word term (e.g., 'digital tablet', 'golden retriever'). Avoid descriptive phrases, sentences, or action-statements in the keywords array. Keep them literal, concrete, and distinct.\n\
                   You must return the response strictly as a JSON object with keys: 'title', 'description', and 'keywords'.";
+
 
     let payload = json!({
         "contents": [{
             "parts": [
-                { "text": prompt },
+                { "text": getty_images_improved_prompt },
                 {
                     "inlineData": {
                         "mimeType": "image/jpeg",
