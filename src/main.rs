@@ -136,7 +136,7 @@ async fn query_gemini_vision(
     });
 
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={}",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={}",
         api_key
     );
 
@@ -171,7 +171,68 @@ async fn query_gemini_vision(
     Ok(metadata)
 }
 
-fn write_iptc_headers(image_path: &Path, metadata: StockMetadata) -> Result<(), Box<dyn Error>> {
+#[derive(Default)]
+struct ExtraTags {
+    country: Option<String>,
+    camera_make: Option<String>,
+    camera_model: Option<String>,
+}
+
+fn existing_exif_field(image_path: &Path, tag: &str) -> Option<String> {
+    let out = Command::new("exiftool")
+        .arg("-s3") // value only
+        .arg(format!("-{}", tag))
+        .arg(image_path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn run_exiftool(args: &[&std::ffi::OsStr]) -> Result<(), Box<dyn Error>> {
+    let output = Command::new("exiftool")
+        .args(args)
+        .output()
+        .map_err(|e| -> Box<dyn Error> {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "exiftool not found on PATH (install via `brew install exiftool`)".into()
+            } else {
+                format!("failed to invoke exiftool: {}", e).into()
+            }
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("exiftool failed: {}", stderr.trim()).into());
+    }
+    Ok(())
+}
+
+fn write_iptc_headers(
+    image_path: &Path,
+    metadata: StockMetadata,
+    extras: &ExtraTags,
+) -> Result<(), Box<dyn Error>> {
+    use std::ffi::OsString;
+
+    // exiftool quirk: list-type tags (XMP-dc:Subject is a Bag) cannot be both
+    // cleared and re-populated in the same invocation — the clear is silently
+    // dropped. So we do it in two passes: first clear, then write.
+    let clear_args: Vec<OsString> = vec![
+        "-overwrite_original".into(),
+        "-m".into(),
+        "-XMP-dc:Subject=".into(),
+        image_path.as_os_str().to_os_string(),
+    ];
+    let clear_refs: Vec<&std::ffi::OsStr> = clear_args.iter().map(|s| s.as_os_str()).collect();
+    run_exiftool(&clear_refs)?;
+
     let mut cmd = Command::new("exiftool");
     cmd.arg("-overwrite_original")
         .arg("-m") // tolerate minor errors
@@ -183,8 +244,7 @@ fn write_iptc_headers(image_path: &Path, metadata: StockMetadata) -> Result<(), 
         .arg(format!("-IPTC:ObjectName={}", metadata.title))
         .arg(format!("-IPTC:Caption-Abstract={}", metadata.description))
         .arg(format!("-XMP-dc:Title={}", metadata.title))
-        .arg(format!("-XMP-dc:Description={}", metadata.description))
-        .arg("-XMP-dc:Subject=");
+        .arg(format!("-XMP-dc:Description={}", metadata.description));
 
     for keyword in &metadata.keywords {
         let trimmed = keyword.trim();
@@ -193,6 +253,26 @@ fn write_iptc_headers(image_path: &Path, metadata: StockMetadata) -> Result<(), 
         }
         cmd.arg(format!("-IPTC:Keywords+={}", trimmed));
         cmd.arg(format!("-XMP-dc:Subject+={}", trimmed));
+    }
+
+    if let Some(country) = extras.country.as_deref() {
+        cmd.arg(format!("-IPTC:Country-PrimaryLocationName={}", country));
+        cmd.arg(format!("-XMP-photoshop:Country={}", country));
+        cmd.arg(format!("-XMP-iptcExt:LocationCreatedCountryName={}", country));
+        cmd.arg(format!("-XMP-iptcExt:LocationShownCountryName={}", country));
+    }
+
+    // Only fill camera fields if the source JPEG doesn't already carry them,
+    // so we never clobber genuine EXIF from a real camera.
+    if let Some(make) = extras.camera_make.as_deref() {
+        if existing_exif_field(image_path, "EXIF:Make").is_none() {
+            cmd.arg(format!("-EXIF:Make={}", make));
+        }
+    }
+    if let Some(model) = extras.camera_model.as_deref() {
+        if existing_exif_field(image_path, "EXIF:Model").is_none() {
+            cmd.arg(format!("-EXIF:Model={}", model));
+        }
     }
 
     cmd.arg(image_path);
@@ -273,6 +353,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(2000);
 
+    let extras = ExtraTags {
+        country: Some(
+            env::var("DEFAULT_COUNTRY")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "United Kingdom".to_string()),
+        ),
+        camera_make: Some(
+            env::var("DEFAULT_CAMERA_MAKE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "Panasonic".to_string()),
+        ),
+        camera_model: Some(
+            env::var("DEFAULT_CAMERA_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "DC-S5M2X".to_string()),
+        ),
+    };
+
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         warn_!("🚀 Automated Stock Photo Tagger");
@@ -318,7 +419,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     metadata.title,
                     metadata.keywords.len()
                 );
-                if let Err(iptc_err) = write_iptc_headers(target_path, metadata) {
+                if let Err(iptc_err) = write_iptc_headers(target_path, metadata, &extras) {
                     warn_!(
                         "❌ IPTC write failed for [{}]: {}",
                         target_path.display(),

@@ -31,6 +31,15 @@ GEMINI_API_KEY=your-key-here
 GEMINI_RATE_LIMIT_MS=2000
 # Optional — defaults to ./photo_tagger.log in the current working directory.
 LOG_FILE=/path/to/photo_tagger.log
+
+# Optional — extra fields some stock sites (e.g. Pond5) require.
+# Defaults (when unset): country="United Kingdom", make="Panasonic", model="DC-S5M2X" (Lumix S5IIx).
+# Country is written to IPTC, XMP-photoshop and XMP-iptcExt schemas.
+DEFAULT_COUNTRY=United Kingdom
+# Camera make/model are only written if the source JPEG has no EXIF Make/Model
+# yet — existing real camera data is never overwritten.
+DEFAULT_CAMERA_MAKE=Panasonic
+DEFAULT_CAMERA_MODEL=DC-S5M2X
 ```
 
 ## Usage
@@ -44,6 +53,8 @@ cargo build --release
 ```
 
 The metadata is written in-place. Both IPTC Core (`ObjectName`, `Caption-Abstract`, `Keywords`) and XMP Dublin Core (`dc:Title`, `dc:Description`, `dc:Subject`) fields are populated, which covers every major stock agency's parser.
+
+If `DEFAULT_COUNTRY` is set, it is also written to `IPTC:Country-PrimaryLocationName`, `XMP-photoshop:Country`, and `XMP-iptcExt:LocationCreated/LocationShown CountryName`. If `DEFAULT_CAMERA_MAKE` / `DEFAULT_CAMERA_MODEL` are set, they are written to `EXIF:Make` / `EXIF:Model` **only when the source file does not already have them** — genuine camera EXIF is never overwritten.
 
 ## Logs
 
