@@ -1,5 +1,0 @@
-2026-05-17T21:04:51.858+0100 [info] ⚙️  Found 1 image target(s) to process. Logging to photo_tagger.log
-2026-05-17T21:04:51.861+0100 [info] [1/1] Processing: /tmp/test_photo.jpg
-2026-05-17T21:05:09.701+0100 [info]    → title: Misty Autumn Forest and Emerald Lake | keywords: 25
-2026-05-17T21:05:10.394+0100 [info] ✅ Embedded IPTC metadata.
-2026-05-17T21:05:10.394+0100 [info] 🎉 Done.

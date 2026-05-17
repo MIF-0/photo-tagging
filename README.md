@@ -29,6 +29,10 @@ Create a `.env` file in the project root:
 ```
 GEMINI_API_KEY=your-key-here
 GEMINI_RATE_LIMIT_MS=2000
+# Optional — Gemini model name. Defaults to "gemini-2.5-flash-lite" (highest
+# free-tier quota). Use "gemini-2.5-flash" for better quality, or
+# "gemini-3-flash" / preview models if you've enabled billing.
+GEMINI_MODEL=gemini-2.5-flash-lite
 # Optional — defaults to ./photo_tagger.log in the current working directory.
 LOG_FILE=/path/to/photo_tagger.log
 
@@ -41,6 +45,20 @@ DEFAULT_COUNTRY=United Kingdom
 DEFAULT_CAMERA_MAKE=Panasonic
 DEFAULT_CAMERA_MODEL=DC-S5M2X
 ```
+
+## Supported Gemini models
+
+Any model exposed by the Gemini `generateContent` REST endpoint will work — set the model id with `GEMINI_MODEL`. Common choices, roughly cheapest → most capable:
+
+| Model id                    | Notes                                                                                 |
+| --------------------------- | ------------------------------------------------------------------------------------- |
+| `gemini-2.5-flash-lite`     | **Default.** Fastest and cheapest. Highest free-tier daily quota. Quality is fine for stock keywording. |
+| `gemini-2.5-flash`          | Better captions and keyword precision. Still very generous free-tier quotas.          |
+| `gemini-2.5-pro`            | Top-tier 2.5 quality. Slower, much smaller free quota — best with billing enabled.    |
+| `gemini-3-flash-preview`    | Preview of the 3.x line. Strong vision, but free tier is capped at ~20 requests/day per project. |
+| `gemini-3-pro` *(if available)* | Highest quality. Paid only in practice.                                           |
+
+Hitting `429 RESOURCE_EXHAUSTED` usually means you've hit the **per-day** free-tier cap on the chosen model — switch to a lighter model (e.g. `gemini-2.5-flash-lite`) or enable billing on the Google AI Studio project.
 
 ## Usage
 

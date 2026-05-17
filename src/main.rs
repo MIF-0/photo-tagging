@@ -25,13 +25,18 @@ fn init_logging(path: &Path) {
         .ok()
         .map(Mutex::new);
     if opened.is_none() {
-        eprintln!("⚠️  Failed to open log file at {} — continuing without file logging.", path.display());
+        eprintln!(
+            "⚠️  Failed to open log file at {} — continuing without file logging.",
+            path.display()
+        );
     }
     let _ = LOG_FILE.set(opened);
 }
 
 fn log_line(stream: &str, message: &str) {
-    let Some(Some(mutex)) = LOG_FILE.get() else { return };
+    let Some(Some(mutex)) = LOG_FILE.get() else {
+        return;
+    };
     if let Ok(mut file) = mutex.lock() {
         let ts = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%z");
         let _ = writeln!(file, "{} [{}] {}", ts, stream, message);
@@ -97,6 +102,7 @@ fn strip_markdown_fence(raw: &str) -> &str {
 async fn query_gemini_vision(
     client: &reqwest::Client,
     api_key: &str,
+    model: &str,
     image_path: &Path,
 ) -> Result<StockMetadata, Box<dyn Error>> {
     let image_bytes = fs::read(image_path)?;
@@ -136,8 +142,8 @@ async fn query_gemini_vision(
     });
 
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={}",
-        api_key
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model, api_key
     );
 
     let response = client.post(&url).json(&payload).send().await?;
@@ -258,7 +264,10 @@ fn write_iptc_headers(
     if let Some(country) = extras.country.as_deref() {
         cmd.arg(format!("-IPTC:Country-PrimaryLocationName={}", country));
         cmd.arg(format!("-XMP-photoshop:Country={}", country));
-        cmd.arg(format!("-XMP-iptcExt:LocationCreatedCountryName={}", country));
+        cmd.arg(format!(
+            "-XMP-iptcExt:LocationCreatedCountryName={}",
+            country
+        ));
         cmd.arg(format!("-XMP-iptcExt:LocationShownCountryName={}", country));
     }
 
@@ -353,6 +362,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(2000);
 
+    let model = env::var("GEMINI_MODEL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "gemini-2.5-flash-lite".to_string());
+
     let extras = ExtraTags {
         country: Some(
             env::var("DEFAULT_COUNTRY")
@@ -398,7 +412,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
         return Ok(());
     }
-    info!("⚙️  Found {} image target(s) to process. Logging to {}", total, log_path);
+    info!(
+        "⚙️  Found {} image target(s) to process. Model: {} | Log: {}",
+        total, model, log_path
+    );
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
@@ -412,7 +429,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             target_path.display()
         );
 
-        match query_gemini_vision(&client, &api_key, target_path).await {
+        match query_gemini_vision(&client, &api_key, &model, target_path).await {
             Ok(metadata) => {
                 info!(
                     "   → title: {} | keywords: {}",
