@@ -2,10 +2,10 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use iptc::{IPTCTag, IPTC};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::sleep;
@@ -74,7 +74,6 @@ async fn query_gemini_vision(
                   CRITICAL GETTY IMAGES CONSTRAINT: Every keyword must be a single, standalone word or a universally standard two-word term (e.g., 'digital tablet', 'golden retriever'). Avoid descriptive phrases, sentences, or action-statements in the keywords array. Keep them literal, concrete, and distinct.\n\
                   You must return the response strictly as a JSON object with keys: 'title', 'description', and 'keywords'.";
 
-
     let payload = json!({
         "contents": [{
             "parts": [
@@ -129,25 +128,43 @@ async fn query_gemini_vision(
 }
 
 fn write_iptc_headers(image_path: &Path, metadata: StockMetadata) -> Result<(), Box<dyn Error>> {
-    let mut iptc = match IPTC::read_from_path(image_path) {
-        Ok(data) => data,
-        Err(_) => match fs::read(image_path) {
-            Ok(bytes) => IPTC::read_from_buffer(&bytes).unwrap_or_else(|_| IPTC::new()),
-            Err(_) => IPTC::new(),
-        },
-    };
-
-    iptc.set_tag(IPTCTag::ObjectName, &metadata.title);
-    iptc.set_tag(IPTCTag::Caption, &metadata.description);
+    let mut cmd = Command::new("exiftool");
+    cmd.arg("-overwrite_original")
+        .arg("-m") // tolerate minor errors
+        .arg("-codedcharacterset=utf8")
+        // Rebuild the Photoshop IRB from scratch. Some source JPEGs (e.g. the
+        // bundled example) ship with a malformed IRB that blocks any IPTC write
+        // until the segment is regenerated.
+        .arg("-Photoshop:all=")
+        .arg(format!("-IPTC:ObjectName={}", metadata.title))
+        .arg(format!("-IPTC:Caption-Abstract={}", metadata.description))
+        .arg(format!("-XMP-dc:Title={}", metadata.title))
+        .arg(format!("-XMP-dc:Description={}", metadata.description))
+        .arg("-XMP-dc:Subject=");
 
     for keyword in &metadata.keywords {
         let trimmed = keyword.trim();
-        if !trimmed.is_empty() {
-            iptc.set_tag(IPTCTag::Keywords, trimmed);
+        if trimmed.is_empty() {
+            continue;
         }
+        cmd.arg(format!("-IPTC:Keywords+={}", trimmed));
+        cmd.arg(format!("-XMP-dc:Subject+={}", trimmed));
     }
 
-    iptc.write_to_file(image_path)?;
+    cmd.arg(image_path);
+
+    let output = cmd.output().map_err(|e| -> Box<dyn Error> {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "exiftool not found on PATH (install via `brew install exiftool`)".into()
+        } else {
+            format!("failed to invoke exiftool: {}", e).into()
+        }
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("exiftool failed: {}", stderr.trim()).into());
+    }
     Ok(())
 }
 
