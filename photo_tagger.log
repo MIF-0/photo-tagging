@@ -1,0 +1,5 @@
+2026-05-17T20:26:57.987+0100 [info] ⚙️  Found 1 image target(s) to process. Logging to photo_tagger.log
+2026-05-17T20:26:57.991+0100 [info] [1/1] Processing: /Users/vladyslav.bukatin/projects/own/photo-tagging/example/tree-with-orange-leaves-zugspitze-lake-eibsee.jpg
+2026-05-17T20:27:06.442+0100 [info]    → title: Misty Forest Lake Through Autumn Branches | keywords: 25
+2026-05-17T20:27:06.672+0100 [info] ✅ Embedded IPTC metadata.
+2026-05-17T20:27:06.672+0100 [info] 🎉 Done.

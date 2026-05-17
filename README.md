@@ -29,6 +29,8 @@ Create a `.env` file in the project root:
 ```
 GEMINI_API_KEY=your-key-here
 GEMINI_RATE_LIMIT_MS=2000
+# Optional — defaults to ./photo_tagger.log in the current working directory.
+LOG_FILE=/path/to/photo_tagger.log
 ```
 
 ## Usage
@@ -42,3 +44,11 @@ cargo build --release
 ```
 
 The metadata is written in-place. Both IPTC Core (`ObjectName`, `Caption-Abstract`, `Keywords`) and XMP Dublin Core (`dc:Title`, `dc:Description`, `dc:Subject`) fields are populated, which covers every major stock agency's parser.
+
+## Logs
+
+Every line printed to the console is also written (with an ISO-8601 timestamp) to the log file at `$LOG_FILE` (default: `photo_tagger.log` in the current working directory). The file is truncated on each run, so it always reflects the most recent invocation. Useful for batch runs:
+
+```sh
+tail -f photo_tagger.log
+```

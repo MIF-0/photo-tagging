@@ -1,14 +1,58 @@
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::sleep;
+
+static LOG_FILE: OnceLock<Option<Mutex<fs::File>>> = OnceLock::new();
+
+fn init_logging(path: &Path) {
+    let opened = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .ok()
+        .map(Mutex::new);
+    if opened.is_none() {
+        eprintln!("⚠️  Failed to open log file at {} — continuing without file logging.", path.display());
+    }
+    let _ = LOG_FILE.set(opened);
+}
+
+fn log_line(stream: &str, message: &str) {
+    let Some(Some(mutex)) = LOG_FILE.get() else { return };
+    if let Ok(mut file) = mutex.lock() {
+        let ts = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%z");
+        let _ = writeln!(file, "{} [{}] {}", ts, stream, message);
+    }
+}
+
+macro_rules! info {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        println!("{}", msg);
+        $crate::log_line("info", &msg);
+    }};
+}
+
+macro_rules! warn_ {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        eprintln!("{}", msg);
+        $crate::log_line("warn", &msg);
+    }};
+}
 
 #[derive(Deserialize, Debug)]
 struct GeminiResponse {
@@ -213,10 +257,13 @@ fn collect_targets(input: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
 
+    let log_path = env::var("LOG_FILE").unwrap_or_else(|_| "photo_tagger.log".to_string());
+    init_logging(Path::new(&log_path));
+
     let api_key = match env::var("GEMINI_API_KEY") {
         Ok(v) if !v.trim().is_empty() => v,
         _ => {
-            eprintln!("❌ GEMINI_API_KEY is not set (env var or .env file).");
+            warn_!("❌ GEMINI_API_KEY is not set (env var or .env file).");
             std::process::exit(1);
         }
     };
@@ -228,8 +275,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("🚀 Automated Stock Photo Tagger");
-        eprintln!("Usage: {} <file_or_directory>", args[0]);
+        warn_!("🚀 Automated Stock Photo Tagger");
+        warn_!("Usage: {} <file_or_directory>", args[0]);
         std::process::exit(1);
     }
 
@@ -237,27 +284,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let target_files = match collect_targets(input_target) {
         Ok(files) => files,
         Err(e) => {
-            eprintln!("❌ {}", e);
+            warn_!("❌ {}", e);
             std::process::exit(1);
         }
     };
 
     let total = target_files.len();
     if total == 0 {
-        eprintln!(
+        warn_!(
             "⚠️  No .jpg / .jpeg files found at {}",
             input_target.display()
         );
         return Ok(());
     }
-    println!("⚙️  Found {} image target(s) to process.", total);
+    info!("⚙️  Found {} image target(s) to process. Logging to {}", total, log_path);
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()?;
 
     for (idx, target_path) in target_files.iter().enumerate() {
-        println!(
+        info!(
             "[{}/{}] Processing: {}",
             idx + 1,
             total,
@@ -266,23 +313,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         match query_gemini_vision(&client, &api_key, target_path).await {
             Ok(metadata) => {
-                println!(
+                info!(
                     "   → title: {} | keywords: {}",
                     metadata.title,
                     metadata.keywords.len()
                 );
                 if let Err(iptc_err) = write_iptc_headers(target_path, metadata) {
-                    eprintln!(
+                    warn_!(
                         "❌ IPTC write failed for [{}]: {}",
                         target_path.display(),
                         iptc_err
                     );
                 } else {
-                    println!("✅ Embedded IPTC metadata.");
+                    info!("✅ Embedded IPTC metadata.");
                 }
             }
             Err(api_err) => {
-                eprintln!(
+                warn_!(
                     "❌ Gemini call failed for [{}]: {}",
                     target_path.display(),
                     api_err
@@ -295,6 +342,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    println!("🎉 Done.");
+    info!("🎉 Done.");
     Ok(())
 }
