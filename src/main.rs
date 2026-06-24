@@ -86,6 +86,11 @@ struct StockMetadata {
     keywords: Vec<String>,
 }
 
+#[derive(Deserialize, Debug)]
+struct StockMetadataBatch {
+    results: Vec<StockMetadata>,
+}
+
 fn strip_markdown_fence(raw: &str) -> &str {
     let trimmed = raw.trim();
     let without_prefix = trimmed
@@ -99,14 +104,20 @@ fn strip_markdown_fence(raw: &str) -> &str {
         .trim()
 }
 
-const PROMPT: &str = "Analyze this image for stock photography optimization. Provide:\n\
-                  1. A catchy, highly relevant Title (max 5-7 words).\n\
-                  2. A detailed Description/Caption (1-2 sentences describing the scene).\n\
-                  3. Up to 25 keywords strictly sorted in ORDER OF PRECEDECE (the most important, visible subjects must come first, followed by broader categories, with abstract moods at the very end).\n\
-                  STRICT RULE FOR KEYWORDS: Only include elements that are directly visible or explicitly factual to the scene. Do not guess locations (e.g., 'Tokyo'), seasons, or industries unless there is undeniable visual proof in the image. Avoid fluff.\n\
-                  You must return the response strictly as a JSON object with keys: 'title', 'description', and 'keywords'.\n\
-                  CRITICAL GETTY IMAGES CONSTRAINT: Every keyword must be a single, standalone word or a universally standard two-word term (e.g., 'digital tablet', 'golden retriever'). Avoid descriptive phrases, sentences, or action-statements in the keywords array. Keep them literal, concrete, and distinct.\n\
-                  You must return the response strictly as a JSON object with keys: 'title', 'description', and 'keywords'.";
+fn build_prompt(count: usize) -> String {
+    format!(
+        "Analyze the following {count} image(s) for stock photography optimization. \
+         The images are provided in order, each preceded by a text label like 'Image N:'. \
+         For EACH image independently, provide:\n\
+         1. A catchy, highly relevant Title (max 5-7 words).\n\
+         2. A detailed Description/Caption (1-2 sentences describing the scene).\n\
+         3. Up to 25 keywords strictly sorted in ORDER OF PRECEDENCE (the most important, visible subjects must come first, followed by broader categories, with abstract moods at the very end).\n\
+         STRICT RULE FOR KEYWORDS: Only include elements that are directly visible or explicitly factual to the scene. Do not guess locations (e.g., 'Tokyo'), seasons, or industries unless there is undeniable visual proof in the image. Avoid fluff.\n\
+         CRITICAL GETTY IMAGES CONSTRAINT: Every keyword must be a single, standalone word or a universally standard two-word term (e.g., 'digital tablet', 'golden retriever'). Avoid descriptive phrases, sentences, or action-statements in the keywords array. Keep them literal, concrete, and distinct.\n\
+         You must return the response STRICTLY as a JSON object with a single key 'results', whose value is an array of exactly {count} object(s), one per image IN THE SAME ORDER as the images were provided. Each object must have keys: 'title', 'description', and 'keywords'.",
+        count = count
+    )
+}
 
 #[derive(Clone, Copy, Debug)]
 enum Provider {
@@ -119,6 +130,7 @@ struct LlmConfig {
     api_key: String,
     model: String,
     rate_limit_ms: u64,
+    batch_size: usize,
 }
 
 fn load_llm_config() -> Result<LlmConfig, Box<dyn Error>> {
@@ -127,11 +139,7 @@ fn load_llm_config() -> Result<LlmConfig, Box<dyn Error>> {
         "gemini" => Provider::Gemini,
         "groq" => Provider::Groq,
         other => {
-            return Err(format!(
-                "Unknown PROVIDER '{}'. Use 'gemini' or 'groq'.",
-                other
-            )
-            .into());
+            return Err(format!("Unknown PROVIDER '{}'. Use 'gemini' or 'groq'.", other).into());
         }
     };
 
@@ -165,50 +173,72 @@ fn load_llm_config() -> Result<LlmConfig, Box<dyn Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(2000);
 
+    let batch_size: usize = env::var("BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(10);
+
     Ok(LlmConfig {
         provider,
         api_key,
         model,
         rate_limit_ms,
+        batch_size,
     })
 }
 
-async fn query_vision(
+async fn query_vision_batch(
     client: &reqwest::Client,
     cfg: &LlmConfig,
-    image_path: &Path,
-) -> Result<StockMetadata, Box<dyn Error>> {
-    let image_bytes = fs::read(image_path)?;
-    let base64_image = STANDARD.encode(&image_bytes);
+    image_paths: &[PathBuf],
+) -> Result<Vec<StockMetadata>, Box<dyn Error>> {
+    let mut images = Vec::with_capacity(image_paths.len());
+    for path in image_paths {
+        let image_bytes = fs::read(path)?;
+        images.push(STANDARD.encode(&image_bytes));
+    }
 
     let raw_json = match cfg.provider {
-        Provider::Gemini => call_gemini(client, &cfg.api_key, &cfg.model, &base64_image).await?,
-        Provider::Groq => call_groq(client, &cfg.api_key, &cfg.model, &base64_image).await?,
+        Provider::Gemini => call_gemini(client, &cfg.api_key, &cfg.model, &images).await?,
+        Provider::Groq => call_groq(client, &cfg.api_key, &cfg.model, &images).await?,
     };
 
     let clean = strip_markdown_fence(&raw_json);
-    serde_json::from_str::<StockMetadata>(clean).map_err(|e| {
-        format!("Failed to parse model JSON: {} (payload: {})", e, clean).into()
-    })
+    parse_batch(clean)
+}
+
+// The model is asked for `{"results": [...]}`, but tolerate a bare top-level
+// array too in case it ignores the wrapper.
+fn parse_batch(clean: &str) -> Result<Vec<StockMetadata>, Box<dyn Error>> {
+    if let Ok(batch) = serde_json::from_str::<StockMetadataBatch>(clean) {
+        return Ok(batch.results);
+    }
+    serde_json::from_str::<Vec<StockMetadata>>(clean)
+        .map_err(|e| format!("Failed to parse model JSON: {} (payload: {})", e, clean).into())
 }
 
 async fn call_gemini(
     client: &reqwest::Client,
     api_key: &str,
     model: &str,
-    base64_image: &str,
+    base64_images: &[String],
 ) -> Result<String, Box<dyn Error>> {
+    let mut parts: Vec<serde_json::Value> = Vec::with_capacity(base64_images.len() * 2 + 1);
+    parts.push(json!({ "text": build_prompt(base64_images.len()) }));
+    for (i, base64_image) in base64_images.iter().enumerate() {
+        parts.push(json!({ "text": format!("Image {}:", i + 1) }));
+        parts.push(json!({
+            "inlineData": {
+                "mimeType": "image/jpeg",
+                "data": base64_image
+            }
+        }));
+    }
+
     let payload = json!({
         "contents": [{
-            "parts": [
-                { "text": PROMPT },
-                {
-                    "inlineData": {
-                        "mimeType": "image/jpeg",
-                        "data": base64_image
-                    }
-                }
-            ]
+            "parts": parts
         }],
         "generationConfig": {
             "responseMimeType": "application/json"
@@ -260,17 +290,23 @@ async fn call_groq(
     client: &reqwest::Client,
     api_key: &str,
     model: &str,
-    base64_image: &str,
+    base64_images: &[String],
 ) -> Result<String, Box<dyn Error>> {
-    let data_url = format!("data:image/jpeg;base64,{}", base64_image);
+    let mut content: Vec<serde_json::Value> = Vec::with_capacity(base64_images.len() * 2 + 1);
+    content.push(json!({ "type": "text", "text": build_prompt(base64_images.len()) }));
+    for (i, base64_image) in base64_images.iter().enumerate() {
+        content.push(json!({ "type": "text", "text": format!("Image {}:", i + 1) }));
+        content.push(json!({
+            "type": "image_url",
+            "image_url": { "url": format!("data:image/jpeg;base64,{}", base64_image) }
+        }));
+    }
+
     let payload = json!({
         "model": model,
         "messages": [{
             "role": "user",
-            "content": [
-                { "type": "text", "text": PROMPT },
-                { "type": "image_url", "image_url": { "url": data_url } }
-            ]
+            "content": content
         }],
         "response_format": { "type": "json_object" }
     });
@@ -522,51 +558,76 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
         return Ok(());
     }
+    let batch_size = llm_cfg.batch_size;
+    let total_batches = total.div_ceil(batch_size);
     info!(
-        "⚙️  Found {} image target(s) to process. Provider: {:?} | Model: {} | Log: {}",
-        total, llm_cfg.provider, llm_cfg.model, log_path
+        "⚙️  Found {} image target(s) to process in {} batch(es) of up to {}. Provider: {:?} | Model: {} | Log: {}",
+        total, total_batches, batch_size, llm_cfg.provider, llm_cfg.model, log_path
     );
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()?;
 
-    for (idx, target_path) in target_files.iter().enumerate() {
+    for (batch_idx, chunk) in target_files.chunks(batch_size).enumerate() {
         info!(
-            "[{}/{}] Processing: {}",
-            idx + 1,
-            total,
-            target_path.display()
+            "📦 Batch {}/{} — {} image(s):",
+            batch_idx + 1,
+            total_batches,
+            chunk.len()
         );
+        for path in chunk {
+            info!("   • {}", path.display());
+        }
 
-        match query_vision(&client, &llm_cfg, target_path).await {
-            Ok(metadata) => {
-                info!(
-                    "   → title: {} | keywords: {}",
-                    metadata.title,
-                    metadata.keywords.len()
-                );
-                if let Err(iptc_err) = write_iptc_headers(target_path, metadata, &extras) {
+        match query_vision_batch(&client, &llm_cfg, chunk).await {
+            Ok(results) => {
+                if results.len() != chunk.len() {
                     warn_!(
-                        "❌ IPTC write failed for [{}]: {}",
-                        target_path.display(),
-                        iptc_err
+                        "⚠️  Model returned {} result(s) for {} image(s); pairing by order.",
+                        results.len(),
+                        chunk.len()
                     );
-                } else {
-                    info!("✅ Embedded IPTC metadata.");
+                }
+
+                let mut paired = 0usize;
+                for (target_path, metadata) in chunk.iter().zip(results.into_iter()) {
+                    paired += 1;
+                    info!(
+                        "   → [{}] title: {} | keywords: {}",
+                        target_path.display(),
+                        metadata.title,
+                        metadata.keywords.len()
+                    );
+                    if let Err(iptc_err) = write_iptc_headers(target_path, metadata, &extras) {
+                        warn_!(
+                            "❌ IPTC write failed for [{}]: {}",
+                            target_path.display(),
+                            iptc_err
+                        );
+                    } else {
+                        info!("✅ Embedded IPTC metadata.");
+                    }
+                }
+
+                for unpaired in chunk.iter().skip(paired) {
+                    warn_!(
+                        "❌ No metadata returned for [{}] (model returned too few results).",
+                        unpaired.display()
+                    );
                 }
             }
             Err(api_err) => {
                 warn_!(
-                    "❌ {:?} call failed for [{}]: {}",
+                    "❌ {:?} batch call failed ({} image(s)): {}",
                     llm_cfg.provider,
-                    target_path.display(),
+                    chunk.len(),
                     api_err
                 );
             }
         }
 
-        if idx + 1 < total {
+        if batch_idx + 1 < total_batches {
             sleep(Duration::from_millis(llm_cfg.rate_limit_ms)).await;
         }
     }
