@@ -383,78 +383,100 @@ fn write_iptc_headers(
 ) -> Result<(), Box<dyn Error>> {
     use std::ffi::OsString;
 
-    // exiftool quirk: list-type tags (XMP-dc:Subject is a Bag) cannot be both
-    // cleared and re-populated in the same invocation — the clear is silently
-    // dropped. So we do it in two passes: first clear, then write.
+    // exiftool quirk: list-type tags (XMP-dc:Subject is a Bag, IPTC:Keywords a
+    // list) cannot be both cleared and re-populated in the same invocation — the
+    // clear is silently dropped. So we clear them in a separate first pass to
+    // avoid keywords accumulating across runs. This is non-fatal: if it fails
+    // (e.g. a malformed IRB), the write below will trigger the rebuild fallback.
     let clear_args: Vec<OsString> = vec![
         "-overwrite_original".into(),
         "-m".into(),
         "-XMP-dc:Subject=".into(),
+        "-IPTC:Keywords=".into(),
         image_path.as_os_str().to_os_string(),
     ];
     let clear_refs: Vec<&std::ffi::OsStr> = clear_args.iter().map(|s| s.as_os_str()).collect();
-    run_exiftool(&clear_refs)?;
+    if let Err(clear_err) = run_exiftool(&clear_refs) {
+        warn_!(
+            "⚠️  Could not pre-clear keyword tags for [{}]: {}",
+            image_path.display(),
+            clear_err
+        );
+    }
 
-    let mut cmd = Command::new("exiftool");
-    cmd.arg("-overwrite_original")
-        .arg("-m") // tolerate minor errors
-        .arg("-codedcharacterset=utf8")
-        // Rebuild the Photoshop IRB from scratch. Some source JPEGs (e.g. the
-        // bundled example) ship with a malformed IRB that blocks any IPTC write
-        // until the segment is regenerated.
-        .arg("-Photoshop:all=")
-        .arg(format!("-IPTC:ObjectName={}", metadata.title))
-        .arg(format!("-IPTC:Caption-Abstract={}", metadata.description))
-        .arg(format!("-XMP-dc:Title={}", metadata.title))
-        .arg(format!("-XMP-dc:Description={}", metadata.description));
+    // Only fill camera fields if the source JPEG doesn't already carry them, so
+    // we never clobber genuine EXIF from a real camera.
+    let add_make = extras
+        .camera_make
+        .as_deref()
+        .filter(|_| existing_exif_field(image_path, "EXIF:Make").is_none());
+    let add_model = extras
+        .camera_model
+        .as_deref()
+        .filter(|_| existing_exif_field(image_path, "EXIF:Model").is_none());
 
-    for keyword in &metadata.keywords {
-        let trimmed = keyword.trim();
-        if trimmed.is_empty() {
-            continue;
+    // `rebuild_irb` toggles `-Photoshop:all=`, which wipes and regenerates the
+    // Photoshop IRB. That destroys every *other* IPTC field (city, creator,
+    // copyright, …), so we only use it as a fallback when a normal write fails —
+    // some source JPEGs ship a malformed IRB that blocks IPTC writes until it is
+    // regenerated.
+    let build_args = |rebuild_irb: bool| -> Vec<OsString> {
+        let mut args: Vec<OsString> = Vec::new();
+        args.push("-overwrite_original".into());
+        args.push("-m".into()); // tolerate minor errors
+        args.push("-codedcharacterset=utf8".into());
+        if rebuild_irb {
+            args.push("-Photoshop:all=".into());
         }
-        cmd.arg(format!("-IPTC:Keywords+={}", trimmed));
-        cmd.arg(format!("-XMP-dc:Subject+={}", trimmed));
-    }
+        args.push(format!("-IPTC:ObjectName={}", metadata.title).into());
+        args.push(format!("-IPTC:Caption-Abstract={}", metadata.description).into());
+        args.push(format!("-XMP-dc:Title={}", metadata.title).into());
+        args.push(format!("-XMP-dc:Description={}", metadata.description).into());
 
-    if let Some(country) = extras.country.as_deref() {
-        cmd.arg(format!("-IPTC:Country-PrimaryLocationName={}", country));
-        cmd.arg(format!("-XMP-photoshop:Country={}", country));
-        cmd.arg(format!(
-            "-XMP-iptcExt:LocationCreatedCountryName={}",
-            country
-        ));
-        cmd.arg(format!("-XMP-iptcExt:LocationShownCountryName={}", country));
-    }
-
-    // Only fill camera fields if the source JPEG doesn't already carry them,
-    // so we never clobber genuine EXIF from a real camera.
-    if let Some(make) = extras.camera_make.as_deref() {
-        if existing_exif_field(image_path, "EXIF:Make").is_none() {
-            cmd.arg(format!("-EXIF:Make={}", make));
+        for keyword in &metadata.keywords {
+            let trimmed = keyword.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            args.push(format!("-IPTC:Keywords+={}", trimmed).into());
+            args.push(format!("-XMP-dc:Subject+={}", trimmed).into());
         }
-    }
-    if let Some(model) = extras.camera_model.as_deref() {
-        if existing_exif_field(image_path, "EXIF:Model").is_none() {
-            cmd.arg(format!("-EXIF:Model={}", model));
+
+        if let Some(country) = extras.country.as_deref() {
+            args.push(format!("-IPTC:Country-PrimaryLocationName={}", country).into());
+            args.push(format!("-XMP-photoshop:Country={}", country).into());
+            args.push(format!("-XMP-iptcExt:LocationCreatedCountryName={}", country).into());
+            args.push(format!("-XMP-iptcExt:LocationShownCountryName={}", country).into());
         }
-    }
 
-    cmd.arg(image_path);
-
-    let output = cmd.output().map_err(|e| -> Box<dyn Error> {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            "exiftool not found on PATH (install via `brew install exiftool`)".into()
-        } else {
-            format!("failed to invoke exiftool: {}", e).into()
+        if let Some(make) = add_make {
+            args.push(format!("-EXIF:Make={}", make).into());
         }
-    })?;
+        if let Some(model) = add_model {
+            args.push(format!("-EXIF:Model={}", model).into());
+        }
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("exiftool failed: {}", stderr.trim()).into());
+        args.push(image_path.as_os_str().to_os_string());
+        args
+    };
+
+    // First attempt is non-destructive: it preserves existing IPTC fields such
+    // as city, sub-location, creator, and copyright.
+    let write_args = build_args(false);
+    let write_refs: Vec<&std::ffi::OsStr> = write_args.iter().map(|s| s.as_os_str()).collect();
+    if run_exiftool(&write_refs).is_ok() {
+        return Ok(());
     }
-    Ok(())
+
+    // Fallback: the source JPEG likely has a malformed IRB. Rebuild it. This may
+    // drop other IPTC fields, but that segment was unreadable anyway.
+    warn_!(
+        "⚠️  Standard IPTC write failed for [{}]; retrying with IRB rebuild (other IPTC fields may be lost).",
+        image_path.display()
+    );
+    let rebuild_args = build_args(true);
+    let rebuild_refs: Vec<&std::ffi::OsStr> = rebuild_args.iter().map(|s| s.as_os_str()).collect();
+    run_exiftool(&rebuild_refs)
 }
 
 fn has_jpeg_extension(path: &Path) -> bool {
