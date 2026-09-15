@@ -188,20 +188,48 @@ fn load_llm_config() -> Result<LlmConfig, Box<dyn Error>> {
     })
 }
 
+// Read + base64-encode one image, retrying transient failures. macOS can return
+// EDEADLK ("Resource deadlock avoided", os error 11) or a sharing violation when
+// another process (Spotlight indexing, iCloud/Dropbox sync, antivirus) holds a
+// lock on the file at that instant; a brief wait usually clears it.
+async fn read_image_b64(path: &Path) -> Result<String, Box<dyn Error>> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match tokio::fs::read(path).await {
+            Ok(bytes) => return Ok(STANDARD.encode(&bytes)),
+            Err(e) => {
+                if attempt < MAX_ATTEMPTS {
+                    warn_!(
+                        "   ⏳ Read attempt {}/{} failed for [{}]: {} — retrying…",
+                        attempt,
+                        MAX_ATTEMPTS,
+                        path.display(),
+                        e
+                    );
+                    sleep(Duration::from_millis(300 * attempt as u64)).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(format!(
+        "failed to read {} after {} attempts: {}",
+        path.display(),
+        MAX_ATTEMPTS,
+        last_err.expect("loop runs at least once")
+    )
+    .into())
+}
+
 async fn query_vision_batch(
     client: &reqwest::Client,
     cfg: &LlmConfig,
-    image_paths: &[PathBuf],
+    images: &[String],
 ) -> Result<Vec<StockMetadata>, Box<dyn Error>> {
-    let mut images = Vec::with_capacity(image_paths.len());
-    for path in image_paths {
-        let image_bytes = fs::read(path)?;
-        images.push(STANDARD.encode(&image_bytes));
-    }
-
     let raw_json = match cfg.provider {
-        Provider::Gemini => call_gemini(client, &cfg.api_key, &cfg.model, &images).await?,
-        Provider::Groq => call_groq(client, &cfg.api_key, &cfg.model, &images).await?,
+        Provider::Gemini => call_gemini(client, &cfg.api_key, &cfg.model, images).await?,
+        Provider::Groq => call_groq(client, &cfg.api_key, &cfg.model, images).await?,
     };
 
     let clean = strip_markdown_fence(&raw_json);
@@ -602,18 +630,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
             info!("   • {}", path.display());
         }
 
-        match query_vision_batch(&client, &llm_cfg, chunk).await {
+        // Read the batch's files up front. An unreadable file (e.g. transiently
+        // locked by Spotlight/cloud-sync) is skipped rather than aborting the
+        // whole batch, so its readable siblings still get tagged.
+        let mut readable_paths: Vec<&PathBuf> = Vec::with_capacity(chunk.len());
+        let mut images: Vec<String> = Vec::with_capacity(chunk.len());
+        for path in chunk {
+            match read_image_b64(path).await {
+                Ok(b64) => {
+                    readable_paths.push(path);
+                    images.push(b64);
+                }
+                Err(read_err) => {
+                    warn_!(
+                        "❌ Skipping unreadable file [{}]: {}",
+                        path.display(),
+                        read_err
+                    );
+                }
+            }
+        }
+
+        if images.is_empty() {
+            warn_!("⚠️  No readable images in this batch; skipping API call.");
+            continue;
+        }
+
+        match query_vision_batch(&client, &llm_cfg, &images).await {
             Ok(results) => {
-                if results.len() != chunk.len() {
+                if results.len() != readable_paths.len() {
                     warn_!(
                         "⚠️  Model returned {} result(s) for {} image(s); pairing by order.",
                         results.len(),
-                        chunk.len()
+                        readable_paths.len()
                     );
                 }
 
                 let mut paired = 0usize;
-                for (target_path, metadata) in chunk.iter().zip(results.into_iter()) {
+                for (target_path, metadata) in readable_paths.iter().zip(results.into_iter()) {
                     paired += 1;
                     info!(
                         "   → [{}] title: {} | keywords: {}",
@@ -621,7 +675,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         metadata.title,
                         metadata.keywords.len()
                     );
-                    if let Err(iptc_err) = write_iptc_headers(target_path, metadata, &extras) {
+                    if let Err(iptc_err) =
+                        write_iptc_headers(target_path.as_path(), metadata, &extras)
+                    {
                         warn_!(
                             "❌ IPTC write failed for [{}]: {}",
                             target_path.display(),
@@ -632,7 +688,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
 
-                for unpaired in chunk.iter().skip(paired) {
+                for unpaired in readable_paths.iter().skip(paired) {
                     warn_!(
                         "❌ No metadata returned for [{}] (model returned too few results).",
                         unpaired.display()
@@ -643,7 +699,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 warn_!(
                     "❌ {:?} batch call failed ({} image(s)): {}",
                     llm_cfg.provider,
-                    chunk.len(),
+                    images.len(),
                     api_err
                 );
             }
