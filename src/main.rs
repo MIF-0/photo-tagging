@@ -109,7 +109,7 @@ fn build_prompt(count: usize) -> String {
         "Analyze the following {count} image(s) for stock photography optimization. \
          The images are provided in order, each preceded by a text label like 'Image N:'. \
          For EACH image independently, provide:\n\
-         1. A catchy, highly relevant Title (max 5-7 words), written to drive sales: lead with the terms commercial buyers actually search for and the concept the image sells.\n\
+         1. A catchy, highly relevant Title of 5-7 words that reads as ONE coherent, grammatical sentence: the words must connect into a natural, readable phrase describing the scene, NOT a list of loosely related keywords. The title must never exceed 200 characters. Write it to drive sales: lead with the terms commercial buyers actually search for and the concept the image sells.\n\
          2. A detailed Description/Caption (1-2 sentences describing the scene), also written to drive sales: highlight the commercial concepts and use cases buyers search for, while staying factual to what is visible.\n\
          3. Up to 25 keywords strictly sorted in ORDER OF PRECEDENCE (the most important, visible subjects must come first, followed by broader categories, with abstract moods at the very end).\n\
          STRICT RULE FOR KEYWORDS: Only include elements that are directly visible or explicitly factual to the scene. Do not guess locations (e.g., 'Tokyo'), seasons, or industries unless there is undeniable visual proof in the image. Avoid fluff.\n\
@@ -148,7 +148,7 @@ fn load_llm_config() -> Result<LlmConfig, Box<dyn Error>> {
             "GEMINI_API_KEY",
             "GEMINI_MODEL",
             "GEMINI_RATE_LIMIT_MS",
-            "gemini-2.5-flash-lite",
+            "gemini-3.5-flash-lite",
         ),
         Provider::Groq => (
             "GROQ_API_KEY",
@@ -433,7 +433,8 @@ fn write_iptc_headers(
     }
 
     // Only fill camera fields if the source JPEG doesn't already carry them, so
-    // we never clobber genuine EXIF from a real camera.
+    // we never clobber genuine EXIF from a real camera (an iPhone's own
+    // "Apple" / "iPhone 15 Pro" tags are kept exactly as shot).
     let add_make = extras
         .camera_make
         .as_deref()
