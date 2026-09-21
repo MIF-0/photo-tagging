@@ -1,12 +1,13 @@
 # photo-tagging
 
-A Rust CLI that iterates over JPEG photos and uses a vision LLM (Google Gemini or Groq) to embed an IPTC/XMP title, caption, and up to 25 keywords — optimized for stock photography uploads (Shutterstock, Adobe Stock, Pixta, Getty, Pond5).
+A Rust CLI that iterates over JPEG photos and `.mov` videos and uses a vision LLM (Google Gemini or Groq) to embed a title, caption, and up to 25 keywords — optimized for stock uploads (Shutterstock, Adobe Stock, Pixta, Getty, Pond5). Photos get IPTC + XMP tags; videos get XMP + QuickTime tags (frames are sampled with `ffmpeg` and analyzed as one clip).
 
 ## Requirements
 
 - Rust (stable)
 - A Gemini API key **or** a Groq API key (whichever provider you pick)
-- **`exiftool`** on your `PATH` — used to write the IPTC and XMP fields back into the JPEG. The tool will fail with a clear error if it is missing.
+- **`exiftool`** on your `PATH` — used to write the metadata back into the file. The tool will fail with a clear error if it is missing.
+- **`ffmpeg`** on your `PATH` — only required for tagging `.mov` videos (used to sample frames). Install with `brew install ffmpeg`. Not needed if you only tag photos.
 
 ### Installing exiftool on macOS
 
@@ -33,8 +34,8 @@ PROVIDER=gemini
 # --- Gemini (used when PROVIDER=gemini) ---
 GEMINI_API_KEY=your-gemini-key
 GEMINI_RATE_LIMIT_MS=2000
-# Optional — Gemini model name. Defaults to "gemini-2.5-flash-lite".
-GEMINI_MODEL=gemini-2.5-flash-lite
+# Optional — Gemini model name. Defaults to "gemini-3.5-flash-lite".
+GEMINI_MODEL=gemini-3.5-flash-lite
 
 # --- Groq (used when PROVIDER=groq) ---
 GROQ_API_KEY=your-groq-key
@@ -46,12 +47,17 @@ GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct
 # Optional — defaults to ./photo_tagger.log in the current working directory.
 LOG_FILE=/path/to/photo_tagger.log
 
+# Optional — frames per second sampled from .mov videos (requires ffmpeg).
+# Defaults to 2. The total number of frames per clip is capped internally.
+VIDEO_FPS=2
+
 # Optional — extra fields some stock sites (e.g. Pond5) require.
 # Defaults (when unset): country="United Kingdom", make="Panasonic", model="DC-S5M2X" (Lumix S5IIx).
 # Country is written to IPTC, XMP-photoshop and XMP-iptcExt schemas.
 DEFAULT_COUNTRY=United Kingdom
-# Camera make/model are only written if the source JPEG has no EXIF Make/Model
-# yet — existing real camera data is never overwritten.
+# Camera make/model are only written if the source file has no camera identity
+# yet — existing real camera data (photo EXIF, or a video's QuickTime tags such
+# as an iPhone's Apple / iPhone model) is never overwritten.
 DEFAULT_CAMERA_MAKE=Panasonic
 DEFAULT_CAMERA_MODEL=DC-S5M2X
 ```
@@ -66,11 +72,10 @@ Any model exposed by the Gemini `generateContent` REST endpoint will work — se
 
 | Model id                    | Notes                                                                                 |
 | --------------------------- | ------------------------------------------------------------------------------------- |
-| `gemini-2.5-flash-lite`     | **Default.** Fastest and cheapest. Highest free-tier daily quota. Quality is fine for stock keywording. |
-| `gemini-2.5-flash`          | Better captions and keyword precision. Still very generous free-tier quotas.          |
-| `gemini-2.5-pro`            | Top-tier 2.5 quality. Slower, much smaller free quota — best with billing enabled.    |
-| `gemini-3-flash-preview`    | Preview of the 3.x line. Strong vision, but free tier is capped at ~20 requests/day per project. |
-| `gemini-3-pro` *(if available)* | Highest quality. Paid only in practice.                                           |
+| `gemini-3.5-flash-lite`     | **Default.** Latest low-cost, high-volume tier. Fast and cheap; quality is fine for stock keywording. |
+| `gemini-2.5-flash-lite`     | Previous-generation lite tier. Still available if you prefer it.                      |
+| `gemini-3.5-flash`          | Better captions and keyword precision, at higher cost/latency.                        |
+| `gemini-3.8-flash`          | Newest full-flash model. Highest quality of the flash line; more cost/latency.        |
 
 Hitting `429 RESOURCE_EXHAUSTED` usually means you've hit the **per-day** free-tier cap on the chosen model — switch to a lighter model (e.g. `gemini-2.5-flash-lite`) or enable billing on the Google AI Studio project.
 
@@ -80,17 +85,22 @@ Set `GROQ_MODEL` to any vision-capable model id from the [Groq console model lis
 
 ## Usage
 
-Build the release binary, then point it at a single JPEG or a directory of JPEGs:
+Build the release binary, then point it at a single file or a directory (JPEGs and/or `.mov` videos):
 
 ```sh
 cargo build --release
 ./target/release/photo_tagger path/to/photo.jpg
-./target/release/photo_tagger path/to/folder
+./target/release/photo_tagger path/to/clip.mov
+./target/release/photo_tagger path/to/folder   # mixed photos + videos
 ```
 
 The metadata is written in-place. Both IPTC Core (`ObjectName`, `Caption-Abstract`, `Keywords`) and XMP Dublin Core (`dc:Title`, `dc:Description`, `dc:Subject`) fields are populated, which covers every major stock agency's parser.
 
 If `DEFAULT_COUNTRY` is set, it is also written to `IPTC:Country-PrimaryLocationName`, `XMP-photoshop:Country`, and `XMP-iptcExt:LocationCreated/LocationShown CountryName`. If `DEFAULT_CAMERA_MAKE` / `DEFAULT_CAMERA_MODEL` are set, they are written to `EXIF:Make` / `EXIF:Model` **only when the source file does not already have them** — genuine camera EXIF is never overwritten.
+
+### Videos (`.mov`)
+
+Each `.mov` is sampled into stills with `ffmpeg` (`VIDEO_FPS` frames/second, default 2, capped internally) and the frames are analyzed together as a single clip, yielding one title, description, and keyword set. Because QuickTime has no IPTC/EXIF, the metadata is written as **XMP Dublin Core** (`dc:Title`, `dc:Description`, `dc:Subject`) plus **QuickTime `Keys`** tags (`Title`, `Description`, `Keywords`) — read by Adobe apps, Finder, and QuickTime Player. Country and camera make/model are written the same way, and an existing camera identity (e.g. an iPhone's `Apple` / `iPhone` tags) is preserved rather than overwritten. Each clip is its own API call, so `.mov` files are not batched with photos.
 
 ## Logs
 
