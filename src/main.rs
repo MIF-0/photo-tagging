@@ -113,6 +113,27 @@ const METADATA_RULES: &str = "1. A catchy, highly relevant Title of 5-7 words th
      STRICT RULE FOR KEYWORDS: Only include elements that are directly visible or explicitly factual to the scene. Do not guess locations (e.g., 'Tokyo'), seasons, or industries unless there is undeniable visual proof in the image. Avoid fluff.\n\
      CRITICAL GETTY IMAGES CONSTRAINT: Every keyword must be a single, standalone word or a universally standard two-word term (e.g., 'digital tablet', 'golden retriever'). Avoid descriptive phrases, sentences, or action-statements in the keywords array. Keep them literal, concrete, and distinct.";
 
+// Lowercase everything, then capitalize the first letter of each sentence, so a
+// title or caption reads as sentence case regardless of how the model cased it.
+// Note: proper nouns and acronyms are lowercased too (e.g. "SMPTE" -> "Smpte") —
+// a deliberate trade-off to guarantee "only the first word is capitalized".
+fn to_sentence_case(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut capitalize_next = true;
+    for ch in text.trim().to_lowercase().chars() {
+        if capitalize_next && ch.is_alphabetic() {
+            result.extend(ch.to_uppercase());
+            capitalize_next = false;
+        } else {
+            result.push(ch);
+            if matches!(ch, '.' | '!' | '?') {
+                capitalize_next = true;
+            }
+        }
+    }
+    result
+}
+
 fn build_prompt(count: usize) -> String {
     format!(
         "Analyze the following {count} image(s) for stock photography optimization. \
@@ -260,11 +281,15 @@ async fn query_vision(
     let clean = strip_markdown_fence(&raw_json);
     let mut results = parse_batch(clean)?;
 
-    // The user wants every tag lowercase. Normalize keywords to lowercase (titles
-    // and descriptions keep their natural casing), and drop any duplicates that
-    // lowercasing collapses together (e.g. "Ocean"/"ocean"), preserving order —
-    // duplicate keywords are rejected by some stock agencies.
+    // Normalize casing to stock conventions:
+    //  • Title & description -> sentence case (only sentence-initial words are
+    //    capitalized), flattening the model's occasional Title Case.
+    //  • Keywords -> all lowercase, then de-duplicated case-insensitively while
+    //    preserving order (duplicate keywords are rejected by some agencies).
     for result in &mut results {
+        result.title = to_sentence_case(&result.title);
+        result.description = to_sentence_case(&result.description);
+
         let mut seen = std::collections::HashSet::new();
         result.keywords = std::mem::take(&mut result.keywords)
             .into_iter()
