@@ -258,7 +258,22 @@ async fn query_vision(
     };
 
     let clean = strip_markdown_fence(&raw_json);
-    parse_batch(clean)
+    let mut results = parse_batch(clean)?;
+
+    // The user wants every tag lowercase. Normalize keywords to lowercase (titles
+    // and descriptions keep their natural casing), and drop any duplicates that
+    // lowercasing collapses together (e.g. "Ocean"/"ocean"), preserving order —
+    // duplicate keywords are rejected by some stock agencies.
+    for result in &mut results {
+        let mut seen = std::collections::HashSet::new();
+        result.keywords = std::mem::take(&mut result.keywords)
+            .into_iter()
+            .map(|k| k.trim().to_lowercase())
+            .filter(|k| !k.is_empty() && seen.insert(k.clone()))
+            .collect();
+    }
+
+    Ok(results)
 }
 
 // The model is asked for `{"results": [...]}`, but tolerate a bare top-level
