@@ -115,21 +115,58 @@ const METADATA_RULES: &str = "1. A catchy, highly relevant Title of 5-7 words th
 
 // Lowercase everything, then capitalize the first letter of each sentence, so a
 // title or caption reads as sentence case regardless of how the model cased it.
+// A '.', '!' or '?' only ends a sentence when whitespace follows it (optionally
+// after a closing quote or bracket) and, for '.', when the word before it is not
+// an abbreviation. So decimals ("4.5 inch"), times ("3.30 pm"), ellipses
+// ("event...crowd") and abbreviations ("e.g.", "dr.") do not capitalize the next
+// word, and a sentence that opens with a digit ("4 tips") keeps its next word
+// lowercase.
 // Note: proper nouns and acronyms are lowercased too (e.g. "SMPTE" -> "Smpte") —
 // a deliberate trade-off to guarantee "only the first word is capitalized".
 fn to_sentence_case(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
+    const ABBREVIATIONS: &[&str] = &["mr", "mrs", "ms", "dr", "st", "vs", "jr", "sr", "approx"];
+
+    let lower = text.trim().to_lowercase();
+    let mut result = String::with_capacity(lower.len());
     let mut capitalize_next = true;
-    for ch in text.trim().to_lowercase().chars() {
-        if capitalize_next && ch.is_alphabetic() {
-            result.extend(ch.to_uppercase());
-            capitalize_next = false;
-        } else {
-            result.push(ch);
-            if matches!(ch, '.' | '!' | '?') {
+    // A terminator was just seen; it becomes a sentence break once whitespace follows.
+    let mut pending_break = false;
+    // The current word so far (since the last whitespace), for abbreviation checks.
+    let mut word = String::new();
+
+    for ch in lower.chars() {
+        if ch.is_whitespace() {
+            if pending_break {
                 capitalize_next = true;
+                pending_break = false;
+            }
+            word.clear();
+            result.push(ch);
+            continue;
+        }
+
+        if matches!(ch, '.' | '!' | '?') {
+            // "e.g" / "u.s" / "event.." already contain a '.', so the next '.'
+            // belongs to an abbreviation or an ellipsis, not a sentence end.
+            let stem = word.trim_start_matches(|c: char| !c.is_alphanumeric());
+            let abbreviation = ch == '.' && (stem.contains('.') || ABBREVIATIONS.contains(&stem));
+            pending_break = !abbreviation;
+        } else if !(pending_break && matches!(ch, '"' | '\'' | ')' | ']' | '”' | '’')) {
+            // Anything but closing punctuation right after a terminator cancels
+            // the break ("4.5", "3.30", "e.g").
+            pending_break = false;
+            if capitalize_next && ch.is_alphanumeric() {
+                capitalize_next = false;
+                if ch.is_alphabetic() {
+                    result.extend(ch.to_uppercase());
+                    word.push(ch);
+                    continue;
+                }
             }
         }
+
+        word.push(ch);
+        result.push(ch);
     }
     result
 }
@@ -159,14 +196,7 @@ fn build_video_prompt(frame_count: usize) -> String {
     )
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Provider {
-    Gemini,
-    Groq,
-}
-
 struct LlmConfig {
-    provider: Provider,
     api_key: String,
     model: String,
     rate_limit_ms: u64,
@@ -174,41 +204,17 @@ struct LlmConfig {
 }
 
 fn load_llm_config() -> Result<LlmConfig, Box<dyn Error>> {
-    let provider_raw = env::var("PROVIDER").unwrap_or_else(|_| "gemini".to_string());
-    let provider = match provider_raw.trim().to_lowercase().as_str() {
-        "gemini" => Provider::Gemini,
-        "groq" => Provider::Groq,
-        other => {
-            return Err(format!("Unknown PROVIDER '{}'. Use 'gemini' or 'groq'.", other).into());
-        }
-    };
-
-    let (key_var, model_var, rate_var, default_model) = match provider {
-        Provider::Gemini => (
-            "GEMINI_API_KEY",
-            "GEMINI_MODEL",
-            "GEMINI_RATE_LIMIT_MS",
-            "gemini-3.5-flash-lite",
-        ),
-        Provider::Groq => (
-            "GROQ_API_KEY",
-            "GROQ_MODEL",
-            "GROQ_RATE_LIMIT_MS",
-            "meta-llama/llama-4-scout-17b-16e-instruct",
-        ),
-    };
-
-    let api_key = env::var(key_var)
+    let api_key = env::var("GEMINI_API_KEY")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| format!("{} is not set (env var or .env file).", key_var))?;
+        .ok_or("GEMINI_API_KEY is not set (env var or .env file).")?;
 
-    let model = env::var(model_var)
+    let model = env::var("GEMINI_MODEL")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| default_model.to_string());
+        .unwrap_or_else(|| "gemini-3.5-flash-lite".to_string());
 
-    let rate_limit_ms: u64 = env::var(rate_var)
+    let rate_limit_ms: u64 = env::var("GEMINI_RATE_LIMIT_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2000);
@@ -220,7 +226,6 @@ fn load_llm_config() -> Result<LlmConfig, Box<dyn Error>> {
         .unwrap_or(10);
 
     Ok(LlmConfig {
-        provider,
         api_key,
         model,
         rate_limit_ms,
@@ -269,14 +274,7 @@ async fn query_vision(
     label: &str,
     images: &[String],
 ) -> Result<Vec<StockMetadata>, Box<dyn Error>> {
-    let raw_json = match cfg.provider {
-        Provider::Gemini => {
-            call_gemini(client, &cfg.api_key, &cfg.model, prompt, label, images).await?
-        }
-        Provider::Groq => {
-            call_groq(client, &cfg.api_key, &cfg.model, prompt, label, images).await?
-        }
-    };
+    let raw_json = call_gemini(client, &cfg.api_key, &cfg.model, prompt, label, images).await?;
 
     let clean = strip_markdown_fence(&raw_json);
     let mut results = parse_batch(clean)?;
@@ -364,70 +362,6 @@ async fn call_gemini(
         .next()
         .ok_or("Gemini response candidate contained no parts")?;
     Ok(part.text)
-}
-
-#[derive(Deserialize, Debug)]
-struct GroqResponse {
-    choices: Vec<GroqChoice>,
-}
-
-#[derive(Deserialize, Debug)]
-struct GroqChoice {
-    message: GroqMessage,
-}
-
-#[derive(Deserialize, Debug)]
-struct GroqMessage {
-    content: String,
-}
-
-async fn call_groq(
-    client: &reqwest::Client,
-    api_key: &str,
-    model: &str,
-    prompt: &str,
-    label: &str,
-    base64_images: &[String],
-) -> Result<String, Box<dyn Error>> {
-    let mut content: Vec<serde_json::Value> = Vec::with_capacity(base64_images.len() * 2 + 1);
-    content.push(json!({ "type": "text", "text": prompt }));
-    for (i, base64_image) in base64_images.iter().enumerate() {
-        content.push(json!({ "type": "text", "text": format!("{} {}:", label, i + 1) }));
-        content.push(json!({
-            "type": "image_url",
-            "image_url": { "url": format!("data:image/jpeg;base64,{}", base64_image) }
-        }));
-    }
-
-    let payload = json!({
-        "model": model,
-        "messages": [{
-            "role": "user",
-            "content": content
-        }],
-        "response_format": { "type": "json_object" }
-    });
-
-    let response = client
-        .post("https://api.groq.com/openai/v1/chat/completions")
-        .bearer_auth(api_key)
-        .json(&payload)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let err_text = response.text().await.unwrap_or_default();
-        return Err(format!("Groq API error ({}): {}", status, err_text).into());
-    }
-
-    let res: GroqResponse = response.json().await?;
-    let choice = res
-        .choices
-        .into_iter()
-        .next()
-        .ok_or("Groq response contained no choices")?;
-    Ok(choice.message.content)
 }
 
 #[derive(Default)]
@@ -800,8 +734,7 @@ async fn process_videos(
                 None => warn_!("❌ Model returned no metadata for [{}].", video.display()),
             },
             Err(e) => warn_!(
-                "❌ {:?} video call failed for [{}]: {}",
-                cfg.provider,
+                "❌ Gemini video call failed for [{}]: {}",
                 video.display(),
                 e
             ),
@@ -940,10 +873,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(2.0);
 
     info!(
-        "⚙️  Found {} photo(s) and {} video(s). Provider: {:?} | Model: {} | Log: {}",
+        "⚙️  Found {} photo(s) and {} video(s). Model: {} | Log: {}",
         photo_files.len(),
         video_files.len(),
-        llm_cfg.provider,
         llm_cfg.model,
         log_path
     );
@@ -1048,8 +980,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 Err(api_err) => {
                     warn_!(
-                        "❌ {:?} batch call failed ({} image(s)): {}",
-                        llm_cfg.provider,
+                        "❌ Gemini batch call failed ({} image(s)): {}",
                         images.len(),
                         api_err
                     );
@@ -1073,4 +1004,74 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!("🎉 Done.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_sentence_case;
+
+    #[test]
+    fn sentence_case_flattens_title_case() {
+        assert_eq!(
+            to_sentence_case("  Golden Retriever On A Beach  "),
+            "Golden retriever on a beach"
+        );
+        assert_eq!(
+            to_sentence_case("SUNSET OVER THE SEA. WAVES CRASH! IS IT COLD? YES."),
+            "Sunset over the sea. Waves crash! Is it cold? Yes."
+        );
+        assert_eq!(to_sentence_case(""), "");
+    }
+
+    #[test]
+    fn sentence_case_ignores_decimals_times_and_ellipses() {
+        assert_eq!(
+            to_sentence_case("Close-up of a 4.5 inch smartphone display"),
+            "Close-up of a 4.5 inch smartphone display"
+        );
+        assert_eq!(
+            to_sentence_case("Woman pours a 1.5 liter bottle. She smiles at 3.30 pm."),
+            "Woman pours a 1.5 liter bottle. She smiles at 3.30 pm."
+        );
+        assert_eq!(
+            to_sentence_case("Portrait with an f/1.8 lens"),
+            "Portrait with an f/1.8 lens"
+        );
+        assert_eq!(
+            to_sentence_case("Version 2.0 launch event...crowd cheers"),
+            "Version 2.0 launch event...crowd cheers"
+        );
+    }
+
+    #[test]
+    fn sentence_case_ignores_abbreviations() {
+        assert_eq!(
+            to_sentence_case("Shallow depth of field, e.g. a blurred park"),
+            "Shallow depth of field, e.g. a blurred park"
+        );
+        assert_eq!(
+            to_sentence_case("A flag waves in the U.S. capital"),
+            "A flag waves in the u.s. capital"
+        );
+        assert_eq!(
+            to_sentence_case("Nurse talks to Dr. Lee in a clinic"),
+            "Nurse talks to dr. lee in a clinic"
+        );
+    }
+
+    #[test]
+    fn sentence_case_handles_digits_and_closing_quotes() {
+        assert_eq!(
+            to_sentence_case("4 tips for better photos"),
+            "4 tips for better photos"
+        );
+        assert_eq!(
+            to_sentence_case("Two women laugh. 3 kids play nearby."),
+            "Two women laugh. 3 kids play nearby."
+        );
+        assert_eq!(
+            to_sentence_case("A sign reads \"open.\" A man walks in."),
+            "A sign reads \"open.\" A man walks in."
+        );
+    }
 }
