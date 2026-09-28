@@ -34,7 +34,8 @@ GEMINI_RATE_LIMIT_MS=2000
 # Optional — Gemini model name. Defaults to "gemini-3.8-flash".
 GEMINI_MODEL=gemini-3.8-flash
 
-# Optional — defaults to ./photo_tagger.log in the current working directory.
+# Optional — defaults to photo_tagger.log in the tagged folder (next to stock_grades.csv).
+# A relative path is taken inside the tagged folder; use an absolute path (or ~/…) for one shared log.
 LOG_FILE=/path/to/photo_tagger.log
 
 # Optional — frames per second sampled from .mov videos (requires ffmpeg).
@@ -73,7 +74,7 @@ Any model exposed by the Gemini `generateContent` REST endpoint will work — se
 | `gemini-3.5-flash`          | Better captions, keyword precision and grading judgment than the lite tier, at higher cost/latency. |
 | `gemini-3.8-flash`          | **Default.** Newest full-flash model; highest quality of the flash line, at more cost/latency. |
 
-Hitting `429 RESOURCE_EXHAUSTED` usually means you've hit the **per-day** free-tier cap on the chosen model — switch to a lighter model (e.g. `gemini-2.5-flash-lite`) or enable billing on the Google AI Studio project. A `503 UNAVAILABLE` ("model is currently experiencing high demand") is a temporary capacity problem on Google's side — retry later or switch models.
+Transient errors — `429` rate limits and `500`/`502`/`503`/`504`, such as `503 UNAVAILABLE` ("model is currently experiencing high demand"), as well as timeouts and dropped connections — are retried up to 3 times with backoff (2, 4 and 8 s, or the delay Gemini asks for) before a batch counts as failed; each retry is logged. If a `429 RESOURCE_EXHAUSTED` persists, you've usually hit the **per-day** free-tier cap on the chosen model — switch to a lighter model (e.g. `gemini-2.5-flash-lite`) or enable billing on the Google AI Studio project. A `503` that persists is a capacity problem on Google's side — try again later or switch models.
 
 ## Usage
 
@@ -116,12 +117,12 @@ Treat the grades as a screen, not final quality control: Gemini sees a downscale
 
 ### digiKam
 
-`digicam_photo_tagget_wrap.sh` is a template for digiKam's Batch Queue Manager *Custom Script* tool (replace the placeholder paths). digiKam hands the script a temporary copy of each image and renames it afterwards, so these runs tag the photo but don't add it to the grades report or the best picks — run the tool on the album folder for those. If tagging fails, the wrapper removes the temporary output, so digiKam reports the item as failed instead of keeping an untagged copy. digiKam stops a script after 60 seconds, so in this mode the tool gives up on a slow Gemini request after 50.
+`digicam_photo_tagget_wrap.sh` is a template for digiKam's Batch Queue Manager *Custom Script* tool (replace the placeholder paths). digiKam hands the script a temporary copy of each image and renames it afterwards, so these runs tag the photo but don't add it to the grades report or the best picks — run the tool on the album folder for those. If tagging fails, the wrapper removes the temporary output, so digiKam reports the item as failed instead of keeping an untagged copy. digiKam runs the script once per queued image and kills any single run that takes longer than 60 seconds (a limit built into digiKam; the queue as a whole can run as long as it needs). So when the tool is given a digiKam temp file, it keeps that image's Gemini call, retries included, under 50 seconds. Command-line runs on a folder have no such limit; each request just has a 120-second timeout. digiKam only keeps a script's output in its debug log, so look at `photo_tagger.log` in the album folder instead (see below).
 
 ## Logs
 
-Every line printed to the console is also written (with an ISO-8601 timestamp) to the log file at `$LOG_FILE` (default: `photo_tagger.log` in the current working directory). The file is truncated on each run, so it always reflects the most recent invocation. The tool exits with status 1 if any file couldn't be tagged. Useful for batch runs:
+Every line printed to the console is also written (with an ISO-8601 timestamp) to `photo_tagger.log` in the tagged folder — the same folder as `stock_grades.csv`, whatever the working directory — or to `$LOG_FILE` if set. Each run starts a fresh log that opens with the settings it uses: input, model, the API key (masked to its first and last 4 characters, with its length and whether it came from `.env` or the environment), video frame rate, grades report, best-pick folder and threshold, which `.env` was loaded, working directory and log path. digiKam runs one process per image, so its runs add to a log written in the last 10 minutes instead, and one queue run ends up in one log. The tool exits with status 1 if any file couldn't be tagged. Useful for batch runs:
 
 ```sh
-tail -f photo_tagger.log
+tail -f path/to/folder/photo_tagger.log
 ```

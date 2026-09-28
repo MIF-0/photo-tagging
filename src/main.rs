@@ -18,21 +18,67 @@ use tokio::time::sleep;
 
 static LOG_FILE: OnceLock<Option<Mutex<fs::File>>> = OnceLock::new();
 
-fn init_logging(path: &Path) {
+// How long a digiKam queue's log stays open for its next image (see
+// init_logging).
+const DIGIKAM_LOG_SESSION: Duration = Duration::from_secs(10 * 60);
+
+// Start the run's log: a fresh file, except that digiKam runs one process per
+// image, so a digiKam run adds to a log written within DIGIKAM_LOG_SESSION
+// (the same queue run) instead of wiping the images before it.
+fn init_logging(path: &Path, digikam: bool) {
+    let recent = || {
+        fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age < DIGIKAM_LOG_SESSION)
+    };
+    let append = digikam && recent();
     let opened = OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)
-        .open(path)
-        .ok()
-        .map(Mutex::new);
-    if opened.is_none() {
-        eprintln!(
-            "⚠️  Failed to open log file at {} — continuing without file logging.",
-            path.display()
-        );
+        .append(append)
+        .truncate(!append)
+        .open(path);
+    let file = match opened {
+        Ok(file) => Some(Mutex::new(file)),
+        Err(e) => {
+            eprintln!(
+                "⚠️  Failed to open log file at {}: {} — continuing without file logging.",
+                path.display(),
+                e
+            );
+            None
+        }
+    };
+    let _ = LOG_FILE.set(file);
+}
+
+// The log goes next to the photos (the tagged folder, like the grades report)
+// rather than into the working directory, which apps such as digiKam set to
+// `/`. LOG_FILE overrides it: relative paths are taken inside the tagged
+// folder, and a leading `~/` means the home folder.
+fn run_log_path(input: &Path) -> PathBuf {
+    resolve_log_path(
+        env::var("LOG_FILE").unwrap_or_default().trim(),
+        input,
+        env::var_os("HOME").as_deref(),
+    )
+}
+
+fn resolve_log_path(configured: &str, input: &Path, home: Option<&std::ffi::OsStr>) -> PathBuf {
+    if configured.is_empty() {
+        return report_dir(input).join("photo_tagger.log");
     }
-    let _ = LOG_FILE.set(opened);
+    if let (Some(rest), Some(home)) = (configured.strip_prefix("~/"), home) {
+        return Path::new(home).join(rest);
+    }
+    let path = Path::new(configured);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        report_dir(input).join(path)
+    }
 }
 
 fn log_line(stream: &str, message: &str) {
@@ -45,18 +91,22 @@ fn log_line(stream: &str, message: &str) {
     }
 }
 
+// Console writes ignore errors: println! would panic when the output pipe is
+// closed (e.g. `| head`, or a script host that stopped reading).
 macro_rules! info {
     ($($arg:tt)*) => {{
+        use std::io::Write as _;
         let msg = format!($($arg)*);
-        println!("{}", msg);
+        let _ = writeln!(std::io::stdout(), "{}", msg);
         $crate::log_line("info", &msg);
     }};
 }
 
 macro_rules! warn_ {
     ($($arg:tt)*) => {{
+        use std::io::Write as _;
         let msg = format!($($arg)*);
-        eprintln!("{}", msg);
+        let _ = writeln!(std::io::stderr(), "{}", msg);
         $crate::log_line("warn", &msg);
     }};
 }
@@ -374,7 +424,15 @@ struct LlmConfig {
     model: String,
     rate_limit_ms: u64,
     batch_size: usize,
+    // Total time one API call may take, retries included (None = only the
+    // client's per-request timeout applies).
+    time_budget: Option<Duration>,
 }
+
+// Per-request timeout of the HTTP client.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+// Attempts per API call; see send_with_retries.
+const MAX_ATTEMPTS: u32 = 4;
 
 fn load_llm_config() -> Result<LlmConfig, Box<dyn Error>> {
     let api_key = env::var("GEMINI_API_KEY")
@@ -403,6 +461,7 @@ fn load_llm_config() -> Result<LlmConfig, Box<dyn Error>> {
         model,
         rate_limit_ms,
         batch_size,
+        time_budget: None,
     })
 }
 
@@ -448,16 +507,7 @@ async fn query_vision(
     images: &[String],
     schema: Option<&serde_json::Value>,
 ) -> Result<Vec<StockMetadata>, Box<dyn Error>> {
-    let raw_json = call_gemini(
-        client,
-        &cfg.api_key,
-        &cfg.model,
-        prompt,
-        label,
-        images,
-        schema,
-    )
-    .await?;
+    let raw_json = call_gemini(client, cfg, prompt, label, images, schema).await?;
 
     let clean = strip_markdown_fence(&raw_json);
     let mut results = parse_batch(clean)?;
@@ -496,8 +546,7 @@ fn parse_batch(clean: &str) -> Result<Vec<StockMetadata>, Box<dyn Error>> {
 
 async fn call_gemini(
     client: &reqwest::Client,
-    api_key: &str,
-    model: &str,
+    cfg: &LlmConfig,
     prompt: &str,
     label: &str,
     base64_images: &[String],
@@ -526,24 +575,11 @@ async fn call_gemini(
         "generationConfig": generation_config
     });
 
-    // The key goes in a header, not the query string: reqwest includes the URL
-    // in its errors, which are printed and written to the log file.
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-        model
+        cfg.model
     );
-
-    let response = client
-        .post(&url)
-        .header("x-goog-api-key", api_key)
-        .json(&payload)
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let err_text = response.text().await.unwrap_or_default();
-        return Err(format!("Gemini API error ({}): {}", status, err_text).into());
-    }
+    let response = send_with_retries(client, cfg, &url, &payload).await?;
 
     let res: GeminiResponse = response.json().await?;
     let candidate = res
@@ -564,6 +600,106 @@ async fn call_gemini(
         return Err("Gemini response candidate contained no text".into());
     }
     Ok(text)
+}
+
+// POST to Gemini, retrying its transient failures — rate limits (429), "high
+// demand" and gateway errors (500/502/503/504), dropped connections and
+// timeouts — up to MAX_ATTEMPTS times with backoff, honouring the delay the
+// API suggests and cfg.time_budget. Other errors (a bad key, a rejected
+// request) fail at once. The key goes in a header, not the query string:
+// reqwest includes the URL in its errors, which are printed and logged.
+async fn send_with_retries(
+    client: &reqwest::Client,
+    cfg: &LlmConfig,
+    url: &str,
+    payload: &serde_json::Value,
+) -> Result<reqwest::Response, Box<dyn Error>> {
+    let started = std::time::Instant::now();
+    let mut attempt = 1;
+    loop {
+        let mut request = client
+            .post(url)
+            .header("x-goog-api-key", &cfg.api_key)
+            .json(payload);
+        if let Some(budget) = cfg.time_budget {
+            request = request.timeout(budget.saturating_sub(started.elapsed()));
+        }
+        let (reason, error, suggested_wait) = match request.send().await {
+            Ok(response) if response.status().is_success() => return Ok(response),
+            Ok(response) => {
+                let status = response.status();
+                let header_wait = retry_after(&response);
+                let body = response.text().await.unwrap_or_default();
+                let error = format!("Gemini API error ({}): {}", status, body.trim());
+                if !is_transient(status) {
+                    return Err(error.into());
+                }
+                let wait = header_wait.or_else(|| retry_delay_in_body(&body));
+                (format!("Gemini returned {}", status), error, wait)
+            }
+            Err(e) if e.is_timeout() || e.is_connect() || e.is_request() => {
+                (e.to_string(), e.to_string(), None)
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let wait = suggested_wait
+            .unwrap_or(Duration::from_secs(1 << attempt))
+            .clamp(Duration::from_secs(1), Duration::from_secs(30));
+        let out_of_time = cfg
+            .time_budget
+            .is_some_and(|budget| started.elapsed() + wait >= budget);
+        if attempt == MAX_ATTEMPTS || out_of_time {
+            return Err(match attempt {
+                1 => error,
+                n => format!("{} (gave up after {} attempts)", error, n),
+            }
+            .into());
+        }
+        warn_!(
+            "   ⏳ {} — retrying in {} s (attempt {} of {})…",
+            reason,
+            wait.as_secs(),
+            attempt + 1,
+            MAX_ATTEMPTS
+        );
+        sleep(wait).await;
+        attempt += 1;
+    }
+}
+
+// Rate limits, overload ("high demand") and gateway errors pass with time.
+fn is_transient(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
+}
+
+// A `Retry-After: <seconds>` header.
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let seconds = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+// The `retryDelay` (e.g. "36s") Gemini puts in the details of a rate-limit
+// error.
+fn retry_delay_in_body(body: &str) -> Option<Duration> {
+    let error: serde_json::Value = serde_json::from_str(body).ok()?;
+    error["error"]["details"]
+        .as_array()?
+        .iter()
+        .find_map(|detail| {
+            let seconds: f64 = detail["retryDelay"]
+                .as_str()?
+                .strip_suffix('s')?
+                .parse()
+                .ok()?;
+            Duration::try_from_secs_f64(seconds).ok()
+        })
 }
 
 #[derive(Default)]
@@ -2072,20 +2208,113 @@ fn pick_best(
     picks
 }
 
+// The settings this run uses, at the top of its log. `key_from_environment`:
+// GEMINI_API_KEY was already set before the .env file was read (dotenvy never
+// overrides a set variable).
+fn log_settings(
+    input: &Path,
+    log_path: &Path,
+    env_file: Option<&Path>,
+    key_from_environment: bool,
+    llm: &LlmConfig,
+    grading: &GradingConfig,
+    video_fps: f64,
+) {
+    let absolute = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let dir = report_dir(input);
+    let key_source = match env_file {
+        Some(file) if !key_from_environment => format!("from {}", file.display()),
+        _ => "from the environment".to_string(),
+    };
+
+    info!("   Input:          {}", absolute(input).display());
+    if is_digikam_temp_file(input) {
+        info!("   Mode:           digiKam temp file — tagged only, not added to the grades report or best picks");
+    }
+    info!("   Model:          {}", llm.model);
+    info!(
+        "   API key:        {} ({} characters, {})",
+        mask_key(&llm.api_key),
+        llm.api_key.chars().count(),
+        key_source
+    );
+    info!("   Video frames:   {} fps", video_fps);
+    info!(
+        "   Grades report:  {}",
+        absolute(&dir.join(&grading.report_file)).display()
+    );
+    info!(
+        "   Best picks:     overall > {} → {} (near-duplicates within {} bits)",
+        grading.min_grade,
+        absolute(&dir.join(&grading.best_dir)).display(),
+        grading.max_distance
+    );
+    info!(
+        "   Settings from:  {}",
+        env_file.map_or_else(
+            || "the environment only (no .env found)".to_string(),
+            |p| p.display().to_string()
+        )
+    );
+    info!(
+        "   Working dir:    {}",
+        env::current_dir().map_or_else(|e| format!("unknown ({})", e), |d| d.display().to_string())
+    );
+    info!("   Log:            {}", absolute(log_path).display());
+}
+
+// Enough of a key to tell which one a run used, without writing the secret
+// into log files that live next to the photos.
+fn mask_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 8 {
+        return "•".repeat(chars.len());
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{}…{}", head, tail)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    dotenvy::dotenv().ok();
+    let key_from_environment = env::var_os("GEMINI_API_KEY").is_some();
+    let env_file = dotenvy::dotenv().ok();
 
-    let log_path = env::var("LOG_FILE").unwrap_or_else(|_| "photo_tagger.log".to_string());
-    init_logging(Path::new(&log_path));
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        warn_!("🚀 Automated Stock Photo Tagger");
+        warn_!("Usage: {} <file_or_directory>", args[0]);
+        std::process::exit(1);
+    }
+    let input_target = Path::new(&args[1]);
+    let digikam = is_digikam_temp_file(input_target);
 
-    let llm_cfg = match load_llm_config() {
+    let log_path = run_log_path(input_target);
+    init_logging(&log_path, digikam);
+    // A panic reaches the log too, not only the console.
+    let console_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        log_line("panic", &panic.to_string());
+        console_hook(panic);
+    }));
+    info!(
+        "🚀 photo_tagger {} · {}",
+        env!("CARGO_PKG_VERSION"),
+        Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+
+    let mut llm_cfg = match load_llm_config() {
         Ok(c) => c,
         Err(e) => {
             warn_!("❌ {}", e);
             std::process::exit(1);
         }
     };
+    // digiKam kills a custom script after 60 s and then keeps the untagged
+    // copy, so each API call, retries included, has to give up well before.
+    if digikam {
+        llm_cfg.time_budget = Some(Duration::from_secs(50));
+    }
 
     let extras = ExtraTags {
         country: Some(
@@ -2108,14 +2337,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ),
     };
 
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        warn_!("🚀 Automated Stock Photo Tagger");
-        warn_!("Usage: {} <file_or_directory>", args[0]);
-        std::process::exit(1);
-    }
+    let video_fps: f64 = env::var("VIDEO_FPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&f| f > 0.0)
+        .unwrap_or(2.0);
 
-    let input_target = Path::new(&args[1]);
+    let grading = load_grading_config();
+    log_settings(
+        input_target,
+        &log_path,
+        env_file.as_deref(),
+        key_from_environment,
+        &llm_cfg,
+        &grading,
+        video_fps,
+    );
+
     let target_files = match collect_targets(input_target) {
         Ok(files) => files,
         Err(e) => {
@@ -2138,31 +2376,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let video_fps: f64 = env::var("VIDEO_FPS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&f| f > 0.0)
-        .unwrap_or(2.0);
-
-    let grading = load_grading_config();
-
     info!(
-        "⚙️  Found {} photo(s) and {} video(s). Model: {} | Log: {}",
+        "⚙️  Found {} photo(s) and {} video(s).",
         photo_files.len(),
-        video_files.len(),
-        llm_cfg.model,
-        log_path
+        video_files.len()
     );
 
-    // digiKam kills a custom script after 60 s and then keeps the untagged
-    // copy, so give up on a slow request in time to report the failure.
-    let request_timeout = if is_digikam_temp_file(input_target) {
-        50
-    } else {
-        120
-    };
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(request_timeout))
+        .timeout(REQUEST_TIMEOUT)
         .build()?;
 
     let mut failures = 0;
@@ -2616,6 +2837,79 @@ mod tests {
         ] {
             assert!(!is_plain_name(bad), "{}", bad);
         }
+    }
+
+    #[test]
+    fn log_goes_next_to_the_photos_unless_log_file_says_otherwise() {
+        let dir = test_dir("logpath");
+        let home = std::ffi::OsStr::new("/Users/me");
+        let photo = dir.join("IMG_1.jpg");
+        assert_eq!(
+            resolve_log_path("", &dir, Some(home)),
+            dir.join("photo_tagger.log")
+        );
+        assert_eq!(
+            resolve_log_path("", &photo, Some(home)),
+            dir.join("photo_tagger.log")
+        );
+        assert_eq!(
+            resolve_log_path("logs/run.log", &dir, Some(home)),
+            dir.join("logs/run.log")
+        );
+        assert_eq!(
+            resolve_log_path("/var/tmp/run.log", &dir, Some(home)),
+            PathBuf::from("/var/tmp/run.log")
+        );
+        assert_eq!(
+            resolve_log_path("~/Library/Logs/photo_tagger.log", &dir, Some(home)),
+            PathBuf::from("/Users/me/Library/Logs/photo_tagger.log")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn api_key_is_logged_masked() {
+        assert_eq!(
+            mask_key("AIzaSyD-EXAMPLE-not-a-real-key-0123Xk3Q"),
+            "AIza…Xk3Q"
+        );
+        assert_eq!(mask_key("short"), "•••••");
+        assert_eq!(mask_key(""), "");
+    }
+
+    #[test]
+    fn only_transient_gemini_errors_are_retried() {
+        for code in [429, 500, 502, 503, 504] {
+            assert!(
+                is_transient(reqwest::StatusCode::from_u16(code).unwrap()),
+                "{}",
+                code
+            );
+        }
+        for code in [400, 401, 403, 404] {
+            assert!(
+                !is_transient(reqwest::StatusCode::from_u16(code).unwrap()),
+                "{}",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn retry_delay_comes_from_the_error_details() {
+        let body = r#"{"error": {"code": 429, "details": [
+            {"@type": "type.googleapis.com/google.rpc.QuotaFailure"},
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "36.5s"}
+        ]}}"#;
+        assert_eq!(
+            retry_delay_in_body(body),
+            Some(Duration::from_millis(36_500))
+        );
+        assert_eq!(
+            retry_delay_in_body(r#"{"error": {"details": [{"retryDelay": "-3s"}]}}"#),
+            None
+        );
+        assert_eq!(retry_delay_in_body("Service Unavailable"), None);
     }
 
     #[test]
