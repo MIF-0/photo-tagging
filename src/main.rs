@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -10,6 +11,7 @@ use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::Local;
+use image::{imageops, GrayImage};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::sleep;
@@ -76,7 +78,12 @@ struct Content {
 
 #[derive(Deserialize, Debug)]
 struct Part {
-    text: String,
+    #[serde(default)]
+    text: Option<String>,
+    // Thinking models only return thought summaries when asked to, but never
+    // treat one as the answer if it does show up.
+    #[serde(default)]
+    thought: bool,
 }
 
 #[derive(Deserialize, Debug, Serialize)]
@@ -84,11 +91,114 @@ struct StockMetadata {
     title: String,
     description: String,
     keywords: Vec<String>,
+    // Only photo calls ask for grades (see GRADING_RULES). Both fields are
+    // parsed leniently so a missing or malformed grade never costs a file its
+    // tags.
+    #[serde(default, deserialize_with = "lenient_grades")]
+    grades: Option<Grades>,
+    #[serde(default, deserialize_with = "lenient_notes")]
+    grade_notes: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 struct StockMetadataBatch {
     results: Vec<StockMetadata>,
+}
+
+// 1–10 grades from the photo prompt. `None` means the model didn't return a
+// usable value for that dimension.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize)]
+struct Grades {
+    editing_quality: Option<u8>,
+    technical_quality: Option<u8>,
+    commercial_cleanliness: Option<u8>,
+    market_demand: Option<u8>,
+    overall: Option<u8>,
+}
+
+// The grade keys, in the order the model is asked for them and the report
+// lists them.
+const GRADE_KEYS: [&str; 5] = [
+    "editing_quality",
+    "technical_quality",
+    "commercial_cleanliness",
+    "market_demand",
+    "overall",
+];
+
+impl Grades {
+    // Build from a lookup by grade key.
+    fn from_fn(mut grade: impl FnMut(&str) -> Option<u8>) -> Self {
+        let [editing_quality, technical_quality, commercial_cleanliness, market_demand, overall] =
+            GRADE_KEYS.map(&mut grade);
+        Grades {
+            editing_quality,
+            technical_quality,
+            commercial_cleanliness,
+            market_demand,
+            overall,
+        }
+    }
+
+    // The grades in GRADE_KEYS order.
+    fn values(&self) -> [Option<u8>; 5] {
+        [
+            self.editing_quality,
+            self.technical_quality,
+            self.commercial_cleanliness,
+            self.market_demand,
+            self.overall,
+        ]
+    }
+}
+
+// Parse `grades` field by field, so one malformed value (e.g. "n/a") only
+// drops that grade instead of failing the whole batch's JSON.
+fn lenient_grades<'de, D>(deserializer: D) -> Result<Option<Grades>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .map(|obj| Grades::from_fn(|key| obj.get(key).and_then(grade_from_value))))
+}
+
+// Accept a string, or a list of strings (joined with "; "); anything else
+// counts as no notes rather than failing the whole batch's JSON.
+fn lenient_notes<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            Some(serde_json::Value::String(notes)) => Some(notes),
+            Some(serde_json::Value::Array(items)) => {
+                let parts: Vec<&str> = items.iter().filter_map(|v| v.as_str()).collect();
+                (!parts.is_empty()).then(|| parts.join("; "))
+            }
+            _ => None,
+        },
+    )
+}
+
+// Accept 7, 7.4 or "7"; round to a whole grade and clamp to 1–10. Anything
+// non-numeric counts as missing.
+fn grade_from_value(value: &serde_json::Value) -> Option<u8> {
+    match value {
+        serde_json::Value::Number(n) => normalize_grade(n.as_f64()?),
+        serde_json::Value::String(s) => grade_from_str(s),
+        _ => None,
+    }
+}
+
+fn grade_from_str(text: &str) -> Option<u8> {
+    normalize_grade(text.trim().parse().ok()?)
+}
+
+fn normalize_grade(n: f64) -> Option<u8> {
+    n.is_finite().then(|| n.round().clamp(1.0, 10.0) as u8)
 }
 
 fn strip_markdown_fence(raw: &str) -> &str {
@@ -112,6 +222,9 @@ const METADATA_RULES: &str = "1. A catchy, highly relevant Title of 5-7 words th
      3. Up to 25 keywords strictly sorted in ORDER OF PRECEDENCE (the most important, visible subjects must come first, followed by broader categories, with abstract moods at the very end).\n\
      STRICT RULE FOR KEYWORDS: Only include elements that are directly visible or explicitly factual to the scene. Do not guess locations (e.g., 'Tokyo'), seasons, or industries unless there is undeniable visual proof in the image. Avoid fluff.\n\
      CRITICAL GETTY IMAGES CONSTRAINT: Every keyword must be a single, standalone word or a universally standard two-word term (e.g., 'digital tablet', 'golden retriever'). Avoid descriptive phrases, sentences, or action-statements in the keywords array. Keep them literal, concrete, and distinct.";
+
+// Rule 3's keyword cap, applied after parsing (the model may return more).
+const MAX_KEYWORDS: usize = 25;
 
 // Lowercase everything, then capitalize the first letter of each sentence, so a
 // title or caption reads as sentence case regardless of how the model cased it.
@@ -171,15 +284,75 @@ fn to_sentence_case(text: &str) -> String {
     result
 }
 
+// Photo-only grading rubric, appended after METADATA_RULES. The fixed scale
+// anchors matter: without them models give 7-8 to anything decent, which would
+// make the "overall > BEST_MIN_GRADE" cut meaningless.
+const GRADING_RULES: &str = "4. Grades: integers from 1 to 10, judged against the acceptance standards of professional stock agencies (Adobe Stock, Shutterstock, Getty Images). Grade every image on its own, in absolute terms; never rank or compare it against the other images in this request.\n\
+     - editing_quality: post-processing craft: composition and crop, straight horizons and verticals, retouching (dust spots and distractions removed), tasteful colour grading. Penalize over-processing: halos, oversharpening, an HDR look, oversaturation, banding.\n\
+     - technical_quality: capture-level technical standards: light and exposure (clipped highlights, crushed shadows), noise and grain, colour correction and white balance, focus and sharpness, chromatic aberration, compression artifacts.\n\
+     - commercial_cleanliness: how safe the image is for COMMERCIAL licensing. 10 means there are no recognizable people, logos, brands, trademarks, readable text, identifiable private property or copyrighted artwork; lower it for each such element, since each needs a release or restricts the image to editorial use.\n\
+     - market_demand: how much stock buyers need this content as of today's date: demand for its concept and commercial use cases versus how saturated the subject already is on stock sites.\n\
+     - overall: expected sellability on major stock agencies, weighing all of the above. A serious technical flaw or a commercial-use blocker must keep it low.\n\
+     Scale: 1-3 = likely rejected or unsellable; 4-6 = acceptable but generic, low expected sales; 7-8 = strong and clearly marketable; 9-10 = exceptional and rare. Be strict: most competent images belong in the 4-6 range.\n\
+     5. grade_notes: one short line (at most 20 words) with the main reasons behind the grades, e.g. 'slight shadow noise; logo on mug; strong remote-work concept'.";
+
 fn build_prompt(count: usize) -> String {
     format!(
-        "Analyze the following {count} image(s) for stock photography optimization. \
+        "Today's date is {today}. Analyze the following {count} image(s) for stock photography optimization. \
          The images are provided in order, each preceded by a text label like 'Image N:'. \
-         For EACH image independently, provide:\n{rules}\n\
-         You must return the response STRICTLY as a JSON object with a single key 'results', whose value is an array of exactly {count} object(s), one per image IN THE SAME ORDER as the images were provided. Each object must have keys: 'title', 'description', and 'keywords'.",
+         For EACH image independently, provide:\n{rules}\n{grading}\n\
+         You must return the response STRICTLY as a JSON object with a single key 'results', whose value is an array of exactly {count} object(s), one per image IN THE SAME ORDER as the images were provided. Each object must have keys: 'title', 'description', 'keywords', 'grades' (an object with integer keys 'editing_quality', 'technical_quality', 'commercial_cleanliness', 'market_demand' and 'overall') and 'grade_notes'.",
+        today = Local::now().format("%Y-%m-%d"),
         count = count,
-        rules = METADATA_RULES
+        rules = METADATA_RULES,
+        grading = GRADING_RULES
     )
+}
+
+// Gemini structured-output schema for a photo batch: it enforces the result
+// shape and integer 1–10 grades, so parsing rarely has to fall back. Array
+// lengths are left unbounded on purpose: bounded (and especially nested)
+// arrays multiply the schema's states until Gemini rejects it as too complex
+// ("too many states for serving"), which would fail every batch. The result
+// count and the keyword cap are checked after parsing instead.
+fn photo_response_schema() -> serde_json::Value {
+    let grade_properties: serde_json::Map<String, serde_json::Value> = GRADE_KEYS
+        .iter()
+        .map(|key| {
+            (
+                key.to_string(),
+                json!({ "type": "INTEGER", "minimum": 1, "maximum": 10 }),
+            )
+        })
+        .collect();
+
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "results": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "title": { "type": "STRING" },
+                        "description": { "type": "STRING" },
+                        "keywords": { "type": "ARRAY", "items": { "type": "STRING" } },
+                        "grades": {
+                            "type": "OBJECT",
+                            "properties": grade_properties,
+                            "required": GRADE_KEYS,
+                            "propertyOrdering": GRADE_KEYS
+                        },
+                        "grade_notes": { "type": "STRING" }
+                    },
+                    "required": ["title", "description", "keywords", "grades", "grade_notes"],
+                    // Describe the image first, then grade it.
+                    "propertyOrdering": ["title", "description", "keywords", "grades", "grade_notes"]
+                }
+            }
+        },
+        "required": ["results"]
+    })
 }
 
 // Frames are sampled from a single clip and must be reasoned about together, so
@@ -212,7 +385,7 @@ fn load_llm_config() -> Result<LlmConfig, Box<dyn Error>> {
     let model = env::var("GEMINI_MODEL")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "gemini-3.5-flash-lite".to_string());
+        .unwrap_or_else(|| "gemini-3.8-flash".to_string());
 
     let rate_limit_ms: u64 = env::var("GEMINI_RATE_LIMIT_MS")
         .ok()
@@ -273,8 +446,18 @@ async fn query_vision(
     prompt: &str,
     label: &str,
     images: &[String],
+    schema: Option<&serde_json::Value>,
 ) -> Result<Vec<StockMetadata>, Box<dyn Error>> {
-    let raw_json = call_gemini(client, &cfg.api_key, &cfg.model, prompt, label, images).await?;
+    let raw_json = call_gemini(
+        client,
+        &cfg.api_key,
+        &cfg.model,
+        prompt,
+        label,
+        images,
+        schema,
+    )
+    .await?;
 
     let clean = strip_markdown_fence(&raw_json);
     let mut results = parse_batch(clean)?;
@@ -283,7 +466,8 @@ async fn query_vision(
     //  • Title & description -> sentence case (only sentence-initial words are
     //    capitalized), flattening the model's occasional Title Case.
     //  • Keywords -> all lowercase, then de-duplicated case-insensitively while
-    //    preserving order (duplicate keywords are rejected by some agencies).
+    //    preserving order (duplicate keywords are rejected by some agencies),
+    //    and capped at MAX_KEYWORDS.
     for result in &mut results {
         result.title = to_sentence_case(&result.title);
         result.description = to_sentence_case(&result.description);
@@ -293,6 +477,7 @@ async fn query_vision(
             .into_iter()
             .map(|k| k.trim().to_lowercase())
             .filter(|k| !k.is_empty() && seen.insert(k.clone()))
+            .take(MAX_KEYWORDS)
             .collect();
     }
 
@@ -316,6 +501,7 @@ async fn call_gemini(
     prompt: &str,
     label: &str,
     base64_images: &[String],
+    schema: Option<&serde_json::Value>,
 ) -> Result<String, Box<dyn Error>> {
     let mut parts: Vec<serde_json::Value> = Vec::with_capacity(base64_images.len() * 2 + 1);
     parts.push(json!({ "text": prompt }));
@@ -329,21 +515,30 @@ async fn call_gemini(
         }));
     }
 
+    let mut generation_config = json!({ "responseMimeType": "application/json" });
+    if let Some(schema) = schema {
+        generation_config["responseSchema"] = schema.clone();
+    }
     let payload = json!({
         "contents": [{
             "parts": parts
         }],
-        "generationConfig": {
-            "responseMimeType": "application/json"
-        }
+        "generationConfig": generation_config
     });
 
+    // The key goes in a header, not the query string: reqwest includes the URL
+    // in its errors, which are printed and written to the log file.
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        model, api_key
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+        model
     );
 
-    let response = client.post(&url).json(&payload).send().await?;
+    let response = client
+        .post(&url)
+        .header("x-goog-api-key", api_key)
+        .json(&payload)
+        .send()
+        .await?;
     if !response.status().is_success() {
         let status = response.status();
         let err_text = response.text().await.unwrap_or_default();
@@ -351,17 +546,24 @@ async fn call_gemini(
     }
 
     let res: GeminiResponse = response.json().await?;
-    let part = res
+    let candidate = res
         .candidates
         .into_iter()
         .next()
-        .ok_or("Gemini response contained no candidates")?
+        .ok_or("Gemini response contained no candidates")?;
+    // Thinking models (e.g. the gemini-3.x flash line) may split the answer
+    // across several parts, so join every non-thought text part.
+    let text: String = candidate
         .content
         .parts
         .into_iter()
-        .next()
-        .ok_or("Gemini response candidate contained no parts")?;
-    Ok(part.text)
+        .filter(|p| !p.thought)
+        .filter_map(|p| p.text)
+        .collect();
+    if text.trim().is_empty() {
+        return Err("Gemini response candidate contained no text".into());
+    }
+    Ok(text)
 }
 
 #[derive(Default)]
@@ -672,19 +874,21 @@ fn extract_frames(
 
 // Tag each video: extract frames, ask the model for one combined result, and
 // embed it in the .mov. Each clip is its own API call (its frames fill the
-// request), so videos are not batched with photos or with each other.
+// request), so videos are not batched with photos or with each other. Returns
+// how many videos couldn't be tagged.
 async fn process_videos(
     client: &reqwest::Client,
     cfg: &LlmConfig,
     extras: &ExtraTags,
     videos: &[PathBuf],
     fps: f64,
-) {
+) -> usize {
     // Downscale target for sampled frames, and a hard cap so a long clip can't
     // explode into hundreds of frames (or blow past provider image limits).
     const FRAME_MAX_DIM: u32 = 1024;
     const MAX_FRAMES: usize = 15;
 
+    let mut failures = 0;
     let total = videos.len();
     for (idx, video) in videos.iter().enumerate() {
         info!("🎬 Video {}/{} — {}", idx + 1, total, video.display());
@@ -697,6 +901,7 @@ async fn process_videos(
                     video.display(),
                     e
                 );
+                failures += 1;
                 continue;
             }
         };
@@ -713,11 +918,12 @@ async fn process_videos(
         if frames_b64.is_empty() {
             warn_!("❌ No readable frames for [{}]; skipping.", video.display());
             let _ = fs::remove_dir_all(&dir);
+            failures += 1;
             continue;
         }
 
         let prompt = build_video_prompt(frames_b64.len());
-        match query_vision(client, cfg, &prompt, "Frame", &frames_b64).await {
+        match query_vision(client, cfg, &prompt, "Frame", &frames_b64, None).await {
             Ok(mut results) => match results.drain(..).next() {
                 Some(metadata) => {
                     info!(
@@ -727,17 +933,24 @@ async fn process_videos(
                     );
                     if let Err(e) = write_video_metadata(video, metadata, extras) {
                         warn_!("❌ Metadata write failed for [{}]: {}", video.display(), e);
+                        failures += 1;
                     } else {
                         info!("✅ Embedded video metadata.");
                     }
                 }
-                None => warn_!("❌ Model returned no metadata for [{}].", video.display()),
+                None => {
+                    warn_!("❌ Model returned no metadata for [{}].", video.display());
+                    failures += 1;
+                }
             },
-            Err(e) => warn_!(
-                "❌ Gemini video call failed for [{}]: {}",
-                video.display(),
-                e
-            ),
+            Err(e) => {
+                warn_!(
+                    "❌ Gemini video call failed for [{}]: {}",
+                    video.display(),
+                    e
+                );
+                failures += 1;
+            }
         }
 
         let _ = fs::remove_dir_all(&dir);
@@ -746,6 +959,152 @@ async fn process_videos(
             sleep(Duration::from_millis(cfg.rate_limit_ms)).await;
         }
     }
+    failures
+}
+
+// Tag photos in batches (one API call per batch). After each batch, the grade
+// rows of the photos whose tags were written go to `on_graded`, so they can be
+// saved before the next batch starts. Returns how many photos couldn't be
+// tagged.
+async fn process_photos(
+    client: &reqwest::Client,
+    cfg: &LlmConfig,
+    extras: &ExtraTags,
+    photos: &[PathBuf],
+    mut on_graded: impl FnMut(Vec<GradeRow>),
+) -> usize {
+    let mut failures = 0;
+    let batch_size = cfg.batch_size;
+    let total_batches = photos.len().div_ceil(batch_size);
+    info!(
+        "📸 Tagging {} photo(s) in {} batch(es) of up to {}.",
+        photos.len(),
+        total_batches,
+        batch_size
+    );
+    let schema = photo_response_schema();
+
+    for (batch_idx, chunk) in photos.chunks(batch_size).enumerate() {
+        info!(
+            "📦 Batch {}/{} — {} image(s):",
+            batch_idx + 1,
+            total_batches,
+            chunk.len()
+        );
+        for path in chunk {
+            info!("   • {}", path.display());
+        }
+
+        // Read the batch's files up front. An unreadable file (e.g. transiently
+        // locked by Spotlight/cloud-sync) is skipped rather than aborting the
+        // whole batch, so its readable siblings still get tagged.
+        let mut readable_paths: Vec<&PathBuf> = Vec::with_capacity(chunk.len());
+        let mut images: Vec<String> = Vec::with_capacity(chunk.len());
+        for path in chunk {
+            match read_image_b64(path).await {
+                Ok(b64) => {
+                    readable_paths.push(path);
+                    images.push(b64);
+                }
+                Err(read_err) => {
+                    warn_!(
+                        "❌ Skipping unreadable file [{}]: {}",
+                        path.display(),
+                        read_err
+                    );
+                    failures += 1;
+                }
+            }
+        }
+
+        if images.is_empty() {
+            warn_!("⚠️  No readable images in this batch; skipping API call.");
+            continue;
+        }
+
+        let mut rows = Vec::with_capacity(readable_paths.len());
+        let prompt = build_prompt(images.len());
+        match query_vision(client, cfg, &prompt, "Image", &images, Some(&schema)).await {
+            Ok(results) => {
+                if results.len() != readable_paths.len() {
+                    warn_!(
+                        "⚠️  Model returned {} result(s) for {} image(s); pairing by order.",
+                        results.len(),
+                        readable_paths.len()
+                    );
+                }
+
+                let mut paired = 0usize;
+                for (target_path, mut metadata) in readable_paths.iter().zip(results.into_iter()) {
+                    paired += 1;
+                    info!(
+                        "   → [{}] title: {} | keywords: {}",
+                        target_path.display(),
+                        metadata.title,
+                        metadata.keywords.len()
+                    );
+                    let grades = metadata.grades.take();
+                    let notes = metadata.grade_notes.take().unwrap_or_default();
+                    if let Err(iptc_err) =
+                        write_iptc_headers(target_path.as_path(), metadata, extras)
+                    {
+                        warn_!(
+                            "❌ IPTC write failed for [{}]: {}",
+                            target_path.display(),
+                            iptc_err
+                        );
+                        failures += 1;
+                        continue;
+                    }
+                    info!("✅ Embedded IPTC metadata.");
+                    match grades {
+                        Some(g) => info!(
+                            "   ⭐ overall {} · editing {} · technical {} · commercial {} · market {}",
+                            fmt_grade(g.overall),
+                            fmt_grade(g.editing_quality),
+                            fmt_grade(g.technical_quality),
+                            fmt_grade(g.commercial_cleanliness),
+                            fmt_grade(g.market_demand)
+                        ),
+                        None => warn_!(
+                            "   ⚠️  No grades returned for [{}]; it can't be picked as a best photo.",
+                            target_path.display()
+                        ),
+                    }
+                    rows.push(GradeRow::new(
+                        target_path.as_path(),
+                        grades.unwrap_or_default(),
+                        notes,
+                    ));
+                }
+
+                for unpaired in readable_paths.iter().skip(paired) {
+                    warn_!(
+                        "❌ No metadata returned for [{}] (model returned too few results).",
+                        unpaired.display()
+                    );
+                    failures += 1;
+                }
+            }
+            Err(api_err) => {
+                warn_!(
+                    "❌ Gemini batch call failed ({} image(s)): {}",
+                    images.len(),
+                    api_err
+                );
+                failures += images.len();
+            }
+        }
+
+        if !rows.is_empty() {
+            on_graded(rows);
+        }
+
+        if batch_idx + 1 < total_batches {
+            sleep(Duration::from_millis(cfg.rate_limit_ms)).await;
+        }
+    }
+    failures
 }
 
 fn has_jpeg_extension(path: &Path) -> bool {
@@ -798,6 +1157,919 @@ fn collect_targets(input: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
         .into());
     }
     Ok(targets)
+}
+
+// ---------------------------------------------------------------------------
+// Grades report (stock_grades.csv) and best-pick copies (best_for_stock/)
+// ---------------------------------------------------------------------------
+
+struct GradingConfig {
+    report_file: String,
+    best_dir: String,
+    // A photo qualifies for the best folder when overall > min_grade.
+    min_grade: u8,
+    // Max fingerprint distance (bits out of 64) at which two photos count as
+    // near-duplicates.
+    max_distance: u32,
+}
+
+fn load_grading_config() -> GradingConfig {
+    GradingConfig {
+        report_file: folder_entry_env("GRADES_FILE", "stock_grades.csv"),
+        best_dir: folder_entry_env("BEST_DIR", "best_for_stock"),
+        min_grade: env::var("BEST_MIN_GRADE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(6),
+        max_distance: env::var("SIMILARITY_MAX_DISTANCE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(10),
+    }
+}
+
+// GRADES_FILE and BEST_DIR name an entry inside the tagged folder. The report
+// is keyed by bare file names, so a location shared by several folders (an
+// absolute path, `..`, `~`, a nested path) would mix their rows and copies up.
+fn folder_entry_env(key: &str, default: &str) -> String {
+    let value = env::var(key).unwrap_or_default().trim().to_string();
+    if value.is_empty() {
+        return default.to_string();
+    }
+    if is_plain_name(&value) {
+        return value;
+    }
+    warn_!(
+        "⚠️  {}={:?} must be a plain name inside the tagged folder; using {:?}.",
+        key,
+        value,
+        default
+    );
+    default.to_string()
+}
+
+fn is_plain_name(value: &str) -> bool {
+    let mut components = Path::new(value).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) && !value.starts_with('~')
+}
+
+// digiKam's Batch Queue Manager hands custom scripts a temporary copy named
+// like `BatchTool-XXXXXX.digikamtempfile.JPG` and renames it once the script
+// exits, so a report row or best copy under that name would be meaningless.
+fn is_digikam_temp_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains(".digikamtempfile."))
+}
+
+// One photo's row in the grades report.
+#[derive(Debug, Clone, PartialEq)]
+struct GradeRow {
+    name: String,
+    grades: Grades,
+    notes: String,
+    // Cached near-duplicate fingerprint (None = not computed yet).
+    fingerprint: Option<Fingerprint>,
+    // When the photo was last copied to the best folder ("" = never).
+    copied: String,
+    // Values of the report columns this tool doesn't know (added by the user),
+    // in `Report::extra_headers` order.
+    extra: Vec<String>,
+}
+
+impl GradeRow {
+    fn new(path: &Path, grades: Grades, notes: String) -> Self {
+        GradeRow {
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            grades,
+            notes: notes.trim().to_string(),
+            fingerprint: None,
+            copied: String::new(),
+            extra: Vec::new(),
+        }
+    }
+
+    // Sum of the four sub-grades: the tie-breaker between equal overall grades.
+    fn subtotal(&self) -> u16 {
+        let g = &self.grades;
+        [
+            g.editing_quality,
+            g.technical_quality,
+            g.commercial_cleanliness,
+            g.market_demand,
+        ]
+        .into_iter()
+        .flatten()
+        .map(u16::from)
+        .sum()
+    }
+}
+
+fn fmt_grade(grade: Option<u8>) -> String {
+    grade.map_or_else(|| "–".to_string(), |g| g.to_string())
+}
+
+// The report lives next to the photos: in the tagged folder, or in the file's
+// folder when a single photo was passed.
+fn report_dir(input: &Path) -> PathBuf {
+    if input.is_dir() {
+        return input.to_path_buf();
+    }
+    input
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct Report {
+    // Headers of the columns this tool doesn't know, kept after its own.
+    extra_headers: Vec<String>,
+    rows: Vec<GradeRow>,
+}
+
+// The report's own columns, in the order they're written. `index` is the row
+// number, recomputed on every write.
+fn report_columns() -> impl Iterator<Item = &'static str> {
+    ["name", "index"]
+        .into_iter()
+        .chain(GRADE_KEYS)
+        .chain(["notes", "fingerprint", "copied"])
+}
+
+// Headers are matched ignoring case, surrounding spaces, and spaces or dashes
+// in place of underscores, so a spreadsheet's "Overall" still counts.
+fn column_key(header: &str) -> String {
+    header.trim().to_lowercase().replace([' ', '-'], "_")
+}
+
+// Parse a report leniently: columns are matched by name (so they can be
+// reordered or re-cased), short rows are padded, unknown columns are kept, and
+// unreadable grade cells count as missing. Whatever rewriting the file would
+// lose or change is returned as a problem, so the caller can back it up first.
+fn parse_report(text: &str) -> (Report, Vec<String>) {
+    let mut records = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(text.as_bytes())
+        .into_records();
+    let mut problems = Vec::new();
+    let header = match records.next() {
+        None => return (Report::default(), problems),
+        Some(Ok(header)) => header,
+        Some(Err(e)) => {
+            problems.push(format!("its header is unreadable ({})", e));
+            return (Report::default(), problems);
+        }
+    };
+    let keys: Vec<String> = header.iter().map(column_key).collect();
+    let column = |key: &str| keys.iter().position(|k| k == key);
+    let Some(name_col) = column("name") else {
+        problems.push("it has no `name` column".to_string());
+        return (Report::default(), problems);
+    };
+    for key in GRADE_KEYS.into_iter().chain(["notes"]) {
+        if column(key).is_none() {
+            problems.push(format!("it has no `{}` column", key));
+        }
+    }
+    let extra_cols: Vec<usize> = (0..keys.len())
+        .filter(|&i| !report_columns().any(|c| c == keys[i]))
+        .collect();
+    let mut report = Report {
+        extra_headers: extra_cols
+            .iter()
+            .map(|&i| header[i].trim().to_string())
+            .collect(),
+        rows: Vec::new(),
+    };
+
+    // Spreadsheet row numbers: the header is row 1.
+    for (row_number, record) in (2..).zip(records) {
+        let record = match record {
+            Ok(record) => record,
+            Err(e) => {
+                problems.push(format!("row {} is unreadable ({})", row_number, e));
+                continue;
+            }
+        };
+        let cell = |col: Option<usize>| col.and_then(|i| record.get(i)).unwrap_or("").trim();
+        let name = cell(Some(name_col));
+        if name.is_empty() {
+            if record.iter().any(|v| !v.trim().is_empty()) {
+                problems.push(format!("row {} has no name", row_number));
+            }
+            continue;
+        }
+        let grades = Grades::from_fn(|key| {
+            let raw = cell(column(key));
+            let grade = grade_from_str(raw);
+            if grade.is_none() && !raw.is_empty() {
+                problems.push(format!("{}'s {} {:?} is unreadable", name, key, raw));
+            }
+            grade
+        });
+        report.rows.push(GradeRow {
+            name: name.to_string(),
+            grades,
+            notes: cell(column("notes")).to_string(),
+            fingerprint: Fingerprint::parse(cell(column("fingerprint"))),
+            copied: cell(column("copied")).to_string(),
+            extra: extra_cols
+                .iter()
+                .map(|&i| cell(Some(i)).to_string())
+                .collect(),
+        });
+    }
+    (report, problems)
+}
+
+fn render_report(report: &Report) -> csv::Result<Vec<u8>> {
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    let mut header: Vec<&str> = report_columns().collect();
+    header.extend(report.extra_headers.iter().map(String::as_str));
+    writer.write_record(&header)?;
+    for (index, row) in (1..).zip(&report.rows) {
+        let index = u32::to_string(&index);
+        let grades = row
+            .grades
+            .values()
+            .map(|g| g.map(|g| g.to_string()).unwrap_or_default());
+        let fingerprint = row.fingerprint.map(|f| f.to_string()).unwrap_or_default();
+        let extra =
+            (0..report.extra_headers.len()).map(|i| row.extra.get(i).map_or("", String::as_str));
+        writer.write_record(
+            [row.name.as_str(), &index]
+                .into_iter()
+                .chain(grades.iter().map(String::as_str))
+                .chain([row.notes.as_str(), &fingerprint, &row.copied])
+                .chain(extra),
+        )?;
+    }
+    writer
+        .into_inner()
+        .map_err(|e| csv::Error::from(e.into_error()))
+}
+
+// Merge this run's rows into the report, keyed by each photo's file name as
+// spelled on disk (a case- or normalization-insensitive volume reaches one
+// file by several spellings). Fresh grades replace the old ones, while the
+// copy record and user-added columns carry over; rows whose photo is gone are
+// dropped. Returns the fresh rows' names.
+fn merge_rows(
+    report: &mut Report,
+    fresh: Vec<GradeRow>,
+    on_disk: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut by_name = BTreeMap::new();
+    for mut row in std::mem::take(&mut report.rows) {
+        if let Some(name) = on_disk(&row.name) {
+            row.name.clone_from(&name);
+            by_name.entry(name).or_insert(row);
+        }
+    }
+    let mut names = Vec::with_capacity(fresh.len());
+    for mut row in fresh {
+        if let Some(name) = on_disk(&row.name) {
+            row.name = name;
+        }
+        if let Some(old) = by_name.remove(&row.name) {
+            row.copied = old.copied;
+            row.extra = old.extra;
+        }
+        names.push(row.name.clone());
+        by_name.insert(row.name.clone(), row);
+    }
+    report.rows = by_name.into_values().collect();
+    names
+}
+
+// The files in a folder, to resolve a report name to its spelling on disk:
+// macOS volumes are usually case- and normalization-insensitive, so
+// `p1000123.jpg` and `P1000123.JPG` can name the same photo.
+struct DirIndex {
+    dir: PathBuf,
+    names: HashSet<String>,
+    #[cfg(unix)]
+    by_inode: HashMap<(u64, u64), String>,
+}
+
+impl DirIndex {
+    fn scan(dir: &Path) -> std::io::Result<Self> {
+        let mut index = DirIndex {
+            dir: dir.to_path_buf(),
+            names: HashSet::new(),
+            #[cfg(unix)]
+            by_inode: HashMap::new(),
+        };
+        for entry in fs::read_dir(dir)?.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            match fs::metadata(entry.path()) {
+                Ok(meta) if meta.is_file() => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        index
+                            .by_inode
+                            .insert((meta.dev(), meta.ino()), name.clone());
+                    }
+                    index.names.insert(name);
+                }
+                _ => {}
+            }
+        }
+        Ok(index)
+    }
+
+    // The on-disk spelling of `name`, or None when it isn't a file here.
+    fn resolve(&self, name: &str) -> Option<String> {
+        if self.names.contains(name) {
+            return Some(name.to_string());
+        }
+        let meta = fs::metadata(self.dir.join(name))
+            .ok()
+            .filter(|m| m.is_file())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            self.by_inode.get(&(meta.dev(), meta.ino())).cloned()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
+            let lower = name.to_lowercase();
+            self.names
+                .iter()
+                .find(|n| n.to_lowercase() == lower)
+                .cloned()
+        }
+    }
+}
+
+// The grades report on disk. Every change is a locked read → change → write,
+// so runs that overlap in one folder don't drop each other's rows, and the
+// write goes through a temp file, so an interrupted run can't truncate it.
+struct ReportStore {
+    dir: PathBuf,
+    path: PathBuf,
+    lock_path: PathBuf,
+}
+
+impl ReportStore {
+    fn new(dir: &Path, file_name: &str) -> Self {
+        ReportStore {
+            dir: dir.to_path_buf(),
+            path: dir.join(file_name),
+            lock_path: dir.join(format!(".{}.lock", file_name)),
+        }
+    }
+
+    // Apply `change` to the report and save it; None (after a warning) when
+    // it couldn't be saved.
+    fn update<T>(&mut self, change: impl FnOnce(&mut Report, &DirIndex) -> T) -> Option<T> {
+        match self.try_update(change) {
+            Ok(result) => Some(result),
+            Err(e) => {
+                warn_!(
+                    "❌ Could not update grades report [{}]: {}",
+                    self.path.display(),
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    fn try_update<T>(
+        &mut self,
+        change: impl FnOnce(&mut Report, &DirIndex) -> T,
+    ) -> Result<T, Box<dyn Error>> {
+        let _lock = self.lock()?;
+        let mut report = self.load();
+        let index = DirIndex::scan(&self.dir)?;
+        let result = change(&mut report, &index);
+        write_atomically(&self.path, &render_report(&report)?)?;
+        Ok(result)
+    }
+
+    // Held until the returned file is dropped; None on volumes without file
+    // locks (some network shares), where overlapping runs just aren't guarded.
+    // The lock file stays in the folder: deleting it would race with a run
+    // waiting on it.
+    fn lock(&self) -> std::io::Result<Option<fs::File>> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&self.lock_path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                info!(
+                    "⏳ Waiting for another run to finish updating [{}]…",
+                    self.path.display()
+                );
+                file.lock()?;
+                Ok(Some(file))
+            }
+            Err(std::fs::TryLockError::Error(_)) => Ok(None),
+        }
+    }
+
+    // The report as it is on disk, repaired leniently (see parse_report). A
+    // report that can't be read, or needs repairs and can't be backed up
+    // first, is left untouched and this run's grades go to a new file instead.
+    fn load(&mut self) -> Report {
+        let bytes = match read_retrying(&self.path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Report::default(),
+            Err(e) => return self.divert(&format!("it can't be read ({})", e)),
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let (report, mut problems) = parse_report(&text);
+        if matches!(text, std::borrow::Cow::Owned(_)) {
+            problems.insert(
+                0,
+                "it isn't UTF-8 (re-saved in another encoding?), so some characters were replaced"
+                    .to_string(),
+            );
+        }
+        if problems.is_empty() {
+            return report;
+        }
+        warn_!(
+            "⚠️  Repairing grades report [{}]: {}.",
+            self.path.display(),
+            problems.join("; ")
+        );
+        match write_new(&timestamped_sibling(&self.path, "", ".bak"), &bytes) {
+            Ok(backup) => {
+                warn_!("   The original is kept as [{}].", backup.display());
+                report
+            }
+            Err(e) => self.divert(&format!(
+                "it needs repairs and couldn't be backed up ({})",
+                e
+            )),
+        }
+    }
+
+    // Leave the report untouched and send this run's grades to a new file.
+    fn divert(&mut self, reason: &str) -> Report {
+        let diverted = timestamped_sibling(&self.path, "unmerged-", ".csv");
+        warn_!(
+            "⚠️  Leaving grades report [{}] untouched because {}; this run's grades go to [{}] instead.",
+            self.path.display(),
+            reason,
+            diverted.display()
+        );
+        self.path = diverted;
+        Report::default()
+    }
+}
+
+// Read a whole file, retrying the transient lock errors described at
+// read_image_b64.
+fn read_retrying(path: &Path) -> std::io::Result<Vec<u8>> {
+    const MAX_ATTEMPTS: u64 = 3;
+    let mut attempt = 1;
+    loop {
+        match fs::read(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound && attempt < MAX_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(300 * attempt));
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+// Write through a temp file + rename, so an interrupted write can't leave a
+// truncated file behind.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = temp_sibling(path);
+    let written = fs::File::create(&tmp)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
+}
+
+// Write a file that must not exist yet; returns its path.
+fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?
+        .write_all(bytes)?;
+    Ok(path.to_path_buf())
+}
+
+// A hidden temp name next to `path`, unique to this process so concurrent runs
+// never share one.
+fn temp_sibling(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{}.{}.tmp", name, std::process::id()))
+}
+
+// `<name>.<prefix><timestamp><suffix>` next to `path`, never an existing file.
+fn timestamped_sibling(path: &Path, prefix: &str, suffix: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    (1..)
+        .map(|n: u32| match n {
+            1 => format!("{}.{}{}{}", name, prefix, stamp, suffix),
+            n => format!("{}.{}{}-{}{}", name, prefix, stamp, n, suffix),
+        })
+        .map(|file| path.with_file_name(file))
+        .find(|candidate| !candidate.exists())
+        .expect("some suffix is unused")
+}
+
+// Near-duplicate fingerprint: perceptual hashes of the whole frame and of the
+// subject (see fingerprint_image). Two photos are as far apart as their most
+// different view, so both the framing and the subject have to match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fingerprint {
+    frame: u64,
+    subject: u64,
+}
+
+impl Fingerprint {
+    // Prefix of the stored form. Change it whenever the hashing changes, so
+    // fingerprints cached in reports are recomputed instead of compared.
+    const VERSION: &'static str = "p1:";
+
+    fn distance(&self, other: &Fingerprint) -> u32 {
+        (self.frame ^ other.frame)
+            .count_ones()
+            .max((self.subject ^ other.subject).count_ones())
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let hex = text.strip_prefix(Self::VERSION)?;
+        if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(Fingerprint {
+            frame: u64::from_str_radix(&hex[..16], 16).ok()?,
+            subject: u64::from_str_radix(&hex[16..], 16).ok()?,
+        })
+    }
+}
+
+impl std::fmt::Display for Fingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}{:016x}{:016x}",
+            Self::VERSION,
+            self.frame,
+            self.subject
+        )
+    }
+}
+
+fn fingerprint(path: &Path) -> Result<Fingerprint, Box<dyn Error>> {
+    // Decode by sniffing the file's magic bytes rather than trusting its
+    // extension (cameras write upper-case ".JPG", and misnamed files still
+    // decode).
+    let img = image::load_from_memory(&read_retrying(path)?)?;
+    Ok(fingerprint_image(&img))
+}
+
+// Hash a 512 px grayscale copy: fast to scan, and averaging evens out noise.
+// On a plain backdrop the subject also gets its own hash, because seen whole,
+// distinct products on the same seamless background look alike: the backdrop
+// dominates the frame.
+fn fingerprint_image(img: &image::DynamicImage) -> Fingerprint {
+    let gray = img.thumbnail(512, 512).to_luma8();
+    let frame = phash(&gray, 0.0);
+    // The crop is centred on the subject, so a symmetric product (a ball, a
+    // bottle) cancels out many of its DCT coefficients; a small dead zone keeps
+    // those near-zero ones from flipping bits between the frames of a burst.
+    let subject = subject_square(&gray).map_or(frame, |square| phash(&square, 0.01));
+    Fingerprint { frame, subject }
+}
+
+// 64-bit perceptual hash: shrink to 32×32, take the 8×8 lowest frequencies of
+// its DCT and record which are above their median (plus `dead_zone` times the
+// largest one). Bursts and small edits of one shot land within a few bits of
+// each other.
+fn phash(gray: &GrayImage, dead_zone: f32) -> u64 {
+    const N: usize = 32;
+    let small = imageops::resize(gray, N as u32, N as u32, imageops::FilterType::Triangle);
+    let cos: [[f32; N]; 8] = std::array::from_fn(|k| {
+        std::array::from_fn(|n| {
+            (std::f32::consts::PI * (2 * n + 1) as f32 * k as f32 / (2 * N) as f32).cos()
+        })
+    });
+    // Separable 2-D DCT-II, computing only the 8 lowest frequencies per axis.
+    let rows: [[f32; 8]; N] = std::array::from_fn(|y| {
+        std::array::from_fn(|u| {
+            (0..N)
+                .map(|x| f32::from(small.get_pixel(x as u32, y as u32)[0]) * cos[u][x])
+                .sum()
+        })
+    });
+    let coefficients: [f32; 64] =
+        std::array::from_fn(|i| (0..N).map(|y| rows[y][i % 8] * cos[i / 8][y]).sum());
+    // The first (DC) coefficient only encodes overall brightness.
+    let mut ac = coefficients[1..].to_vec();
+    ac.sort_by(f32::total_cmp);
+    let largest = ac.iter().fold(0.0f32, |max, c| max.max(c.abs()));
+    let threshold = ac[ac.len() / 2] + dead_zone * largest;
+    coefficients
+        .iter()
+        .fold(0, |hash, &c| (hash << 1) | u64::from(c > threshold))
+}
+
+// Luma levels within which a pixel still counts as the plain backdrop.
+const BACKDROP_TOLERANCE: u8 = 16;
+
+// On a plain backdrop (most of the frame's edge within BACKDROP_TOLERANCE of
+// its median, e.g. seamless white or black), a square window around the
+// subject with a 10% margin, padded with the backdrop so the subject's shape
+// and proportions survive; None for ordinary scenes.
+fn subject_square(gray: &GrayImage) -> Option<GrayImage> {
+    let (w, h) = gray.dimensions();
+    if w < 16 || h < 16 {
+        return None;
+    }
+    let mut edge: Vec<u8> = (0..w)
+        .flat_map(|x| [gray.get_pixel(x, 0)[0], gray.get_pixel(x, h - 1)[0]])
+        .chain((1..h - 1).flat_map(|y| [gray.get_pixel(0, y)[0], gray.get_pixel(w - 1, y)[0]]))
+        .collect();
+    edge.sort_unstable();
+    let backdrop = edge[edge.len() / 2];
+    let is_backdrop = |luma: u8| luma.abs_diff(backdrop) <= BACKDROP_TOLERANCE;
+    if edge.iter().filter(|&&luma| is_backdrop(luma)).count() * 10 < edge.len() * 9 {
+        return None;
+    }
+
+    let mut cols = vec![0u32; w as usize];
+    let mut rows = vec![0u32; h as usize];
+    for (x, y, pixel) in gray.enumerate_pixels() {
+        if !is_backdrop(pixel[0]) {
+            cols[x as usize] += 1;
+            rows[y as usize] += 1;
+        }
+    }
+    // First and last column/row holding more than a speck of subject.
+    let span = |counts: &[u32]| {
+        let first = counts.iter().position(|&c| c >= 2)?;
+        let last = counts.iter().rposition(|&c| c >= 2)?;
+        Some((first as i64, (last - first + 1) as i64))
+    };
+    let (x, sw) = span(&cols)?;
+    let (y, sh) = span(&rows)?;
+    if sw < 8 || sh < 8 || (sw == i64::from(w) && sh == i64::from(h)) {
+        return None;
+    }
+
+    let side = (sw.max(sh) as f32 * 1.2).ceil() as i64;
+    let left = x + sw / 2 - side / 2;
+    let top = y + sh / 2 - side / 2;
+    Some(GrayImage::from_fn(side as u32, side as u32, |sx, sy| {
+        let (gx, gy) = (left + i64::from(sx), top + i64::from(sy));
+        if (0..i64::from(w)).contains(&gx) && (0..i64::from(h)).contains(&gy) {
+            *gray.get_pixel(gx as u32, gy as u32)
+        } else {
+            image::Luma([backdrop])
+        }
+    }))
+}
+
+struct BestCandidate {
+    name: String,
+    overall: u8,
+    subtotal: u16,
+    // None when the photo couldn't be decoded; it is then treated as unique.
+    fingerprint: Option<Fingerprint>,
+}
+
+struct Skipped {
+    candidate: BestCandidate,
+    duplicate_of: String,
+    distance: u32,
+}
+
+// Keep the best photo of each near-duplicate group: walk candidates from best to
+// worst (overall, then sub-grade total, then name) and skip any within
+// `max_distance` of a photo already kept.
+fn select_unique(
+    mut candidates: Vec<BestCandidate>,
+    max_distance: u32,
+) -> (Vec<BestCandidate>, Vec<Skipped>) {
+    candidates.sort_by(|a, b| {
+        b.overall
+            .cmp(&a.overall)
+            .then(b.subtotal.cmp(&a.subtotal))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let mut kept: Vec<BestCandidate> = Vec::new();
+    let mut skipped = Vec::new();
+    for candidate in candidates {
+        let duplicate = candidate.fingerprint.and_then(|fp| {
+            kept.iter()
+                .filter_map(|k| k.fingerprint.map(|kf| (k, fp.distance(&kf))))
+                .filter(|&(_, distance)| distance <= max_distance)
+                .min_by_key(|&(_, distance)| distance)
+                .map(|(k, distance)| (k.name.clone(), distance))
+        });
+        match duplicate {
+            Some((duplicate_of, distance)) => skipped.push(Skipped {
+                candidate,
+                duplicate_of,
+                distance,
+            }),
+            None => kept.push(candidate),
+        }
+    }
+    (kept, skipped)
+}
+
+// Copy via a temp name + rename: an existing copy is replaced atomically, and on
+// APFS the copy stays a zero-cost clone (clonefile can't target an existing file).
+fn copy_into(src: &Path, dest_dir: &Path) -> std::io::Result<()> {
+    let name = src.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
+    })?;
+    let dest = dest_dir.join(name);
+    let tmp = temp_sibling(&dest);
+    let _ = fs::remove_file(&tmp);
+    let copied = fs::copy(src, &tmp).and_then(|_| fs::rename(&tmp, &dest));
+    if copied.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    copied
+}
+
+// What pick_best did, by photo name.
+#[derive(Debug, Default)]
+struct BestPicks {
+    copied: Vec<String>,
+    // Picks whose copy the user removed after an earlier run made it.
+    not_recopied: Vec<String>,
+    // Copies in the best folder of photos that are no longer selected.
+    stale: Vec<String>,
+}
+
+// Pick the best photo of each near-duplicate group among every photo in the
+// report with overall > min_grade, and copy the picks into the best folder —
+// after tagging, so the copies carry their tags. A pick graded in this run
+// (`graded_now`) gets a fresh copy; one graded earlier is only copied if it
+// never was (e.g. the run that graded it was interrupted), so an existing copy
+// is never replaced on the strength of an old grade. A copy the user removed
+// is not re-created.
+fn pick_best(
+    report: &mut Report,
+    dir: &Path,
+    graded_now: &HashSet<String>,
+    cfg: &GradingConfig,
+) -> BestPicks {
+    let best_dir = dir.join(&cfg.best_dir);
+    let mut candidates = Vec::new();
+    for row in &mut report.rows {
+        let Some(overall) = row.grades.overall.filter(|&g| g > cfg.min_grade) else {
+            continue;
+        };
+        if row.fingerprint.is_none() {
+            let path = dir.join(&row.name);
+            row.fingerprint = match fingerprint(&path) {
+                Ok(fp) => Some(fp),
+                Err(e) => {
+                    warn_!(
+                        "⚠️  Could not fingerprint [{}] for the duplicate check: {} — treating it as unique.",
+                        path.display(),
+                        e
+                    );
+                    None
+                }
+            };
+        }
+        candidates.push(BestCandidate {
+            name: row.name.clone(),
+            overall,
+            subtotal: row.subtotal(),
+            fingerprint: row.fingerprint,
+        });
+    }
+    let (kept, skipped) = select_unique(candidates, cfg.max_distance);
+
+    info!(
+        "🏆 Best picks (overall > {}) → {}",
+        cfg.min_grade,
+        best_dir.display()
+    );
+    let mut picks = BestPicks::default();
+    let mut to_copy = Vec::new();
+    for pick in &kept {
+        let Some(row) = report.rows.iter().find(|r| r.name == pick.name) else {
+            continue;
+        };
+        let fresh = graded_now.contains(&pick.name);
+        let has_copy = best_dir.join(&pick.name).exists();
+        if !row.copied.is_empty() && !has_copy {
+            if fresh {
+                info!(
+                    "   • {} (overall {}) not copied again: it was removed from {} after an earlier copy (clear its `copied` cell in the report to copy it again).",
+                    pick.name,
+                    pick.overall,
+                    best_dir.display()
+                );
+                picks.not_recopied.push(pick.name.clone());
+            }
+        } else if fresh || (row.copied.is_empty() && !has_copy) {
+            to_copy.push(pick);
+        }
+    }
+    let can_copy = to_copy.is_empty()
+        || match fs::create_dir_all(&best_dir) {
+            Ok(()) => true,
+            Err(e) => {
+                warn_!("❌ Could not create [{}]: {}", best_dir.display(), e);
+                false
+            }
+        };
+    let copied_at = Local::now().format("%Y-%m-%d %H:%M").to_string();
+    for pick in to_copy.into_iter().filter(|_| can_copy) {
+        match copy_into(&dir.join(&pick.name), &best_dir) {
+            Ok(()) => {
+                let earlier = if graded_now.contains(&pick.name) {
+                    ""
+                } else {
+                    ", graded earlier"
+                };
+                info!("   • {} (overall {}{})", pick.name, pick.overall, earlier);
+                if let Some(row) = report.rows.iter_mut().find(|r| r.name == pick.name) {
+                    row.copied.clone_from(&copied_at);
+                }
+                picks.copied.push(pick.name.clone());
+            }
+            Err(e) => warn_!("❌ Could not copy [{}]: {}", pick.name, e),
+        }
+    }
+    let fresh_skips: Vec<&Skipped> = skipped
+        .iter()
+        .filter(|s| graded_now.contains(&s.candidate.name))
+        .collect();
+    for s in &fresh_skips {
+        info!(
+            "   ↪ {} (overall {}) skipped: near-duplicate of {} (distance {})",
+            s.candidate.name, s.candidate.overall, s.duplicate_of, s.distance
+        );
+    }
+
+    // Never delete from the best folder; just point out copies of this folder's
+    // photos that are no longer selected.
+    let kept_names: HashSet<&str> = kept.iter().map(|k| k.name.as_str()).collect();
+    picks.stale = report
+        .rows
+        .iter()
+        .map(|r| &r.name)
+        .filter(|name| !kept_names.contains(name.as_str()) && best_dir.join(name).is_file())
+        .cloned()
+        .collect();
+    if !picks.stale.is_empty() {
+        info!(
+            "ℹ️  No longer selected but still in {} (remove manually if needed): {}",
+            best_dir.display(),
+            picks.stale.join(", ")
+        );
+    }
+
+    info!(
+        "🏆 Copied {} photo(s) to {}; skipped {} near-duplicate(s){}.",
+        picks.copied.len(),
+        best_dir.display(),
+        fresh_skips.len(),
+        match picks.not_recopied.len() {
+            0 => String::new(),
+            n => format!("; {} removed earlier and not copied again", n),
+        }
+    );
+    picks
 }
 
 #[tokio::main]
@@ -872,6 +2144,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .filter(|&f| f > 0.0)
         .unwrap_or(2.0);
 
+    let grading = load_grading_config();
+
     info!(
         "⚙️  Found {} photo(s) and {} video(s). Model: {} | Log: {}",
         photo_files.len(),
@@ -880,135 +2154,76 @@ async fn main() -> Result<(), Box<dyn Error>> {
         log_path
     );
 
+    // digiKam kills a custom script after 60 s and then keeps the untagged
+    // copy, so give up on a slow request in time to report the failure.
+    let request_timeout = if is_digikam_temp_file(input_target) {
+        50
+    } else {
+        120
+    };
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(request_timeout))
         .build()?;
 
+    let mut failures = 0;
     if !photo_files.is_empty() {
-        let batch_size = llm_cfg.batch_size;
-        let total_batches = photo_files.len().div_ceil(batch_size);
-        info!(
-            "📸 Tagging {} photo(s) in {} batch(es) of up to {}.",
-            photo_files.len(),
-            total_batches,
-            batch_size
-        );
-
-        for (batch_idx, chunk) in photo_files.chunks(batch_size).enumerate() {
-            info!(
-                "📦 Batch {}/{} — {} image(s):",
-                batch_idx + 1,
-                total_batches,
-                chunk.len()
-            );
-            for path in chunk {
-                info!("   • {}", path.display());
-            }
-
-            // Read the batch's files up front. An unreadable file (e.g. transiently
-            // locked by Spotlight/cloud-sync) is skipped rather than aborting the
-            // whole batch, so its readable siblings still get tagged.
-            let mut readable_paths: Vec<&PathBuf> = Vec::with_capacity(chunk.len());
-            let mut images: Vec<String> = Vec::with_capacity(chunk.len());
-            for path in chunk {
-                match read_image_b64(path).await {
-                    Ok(b64) => {
-                        readable_paths.push(path);
-                        images.push(b64);
-                    }
-                    Err(read_err) => {
-                        warn_!(
-                            "❌ Skipping unreadable file [{}]: {}",
-                            path.display(),
-                            read_err
-                        );
-                    }
-                }
-            }
-
-            if images.is_empty() {
-                warn_!("⚠️  No readable images in this batch; skipping API call.");
-                continue;
-            }
-
-            match query_vision(
-                &client,
-                &llm_cfg,
-                &build_prompt(images.len()),
-                "Image",
-                &images,
-            )
-            .await
-            {
-                Ok(results) => {
-                    if results.len() != readable_paths.len() {
-                        warn_!(
-                            "⚠️  Model returned {} result(s) for {} image(s); pairing by order.",
-                            results.len(),
-                            readable_paths.len()
-                        );
-                    }
-
-                    let mut paired = 0usize;
-                    for (target_path, metadata) in readable_paths.iter().zip(results.into_iter()) {
-                        paired += 1;
-                        info!(
-                            "   → [{}] title: {} | keywords: {}",
-                            target_path.display(),
-                            metadata.title,
-                            metadata.keywords.len()
-                        );
-                        if let Err(iptc_err) =
-                            write_iptc_headers(target_path.as_path(), metadata, &extras)
-                        {
-                            warn_!(
-                                "❌ IPTC write failed for [{}]: {}",
-                                target_path.display(),
-                                iptc_err
-                            );
-                        } else {
-                            info!("✅ Embedded IPTC metadata.");
-                        }
-                    }
-
-                    for unpaired in readable_paths.iter().skip(paired) {
-                        warn_!(
-                            "❌ No metadata returned for [{}] (model returned too few results).",
-                            unpaired.display()
-                        );
-                    }
-                }
-                Err(api_err) => {
-                    warn_!(
-                        "❌ Gemini batch call failed ({} image(s)): {}",
-                        images.len(),
-                        api_err
+        let mut store = ReportStore::new(&report_dir(input_target), &grading.report_file);
+        let mut graded_now = HashSet::new();
+        failures += process_photos(&client, &llm_cfg, &extras, &photo_files, |mut rows| {
+            rows.retain(|row| {
+                let temp = is_digikam_temp_file(Path::new(&row.name));
+                if temp {
+                    info!(
+                        "   ℹ️  {} is a digiKam temp file — not added to the grades report or best picks.",
+                        row.name
                     );
                 }
+                !temp
+            });
+            // Saved after every batch, so an interrupted run keeps what it graded.
+            if !rows.is_empty() {
+                if let Some(names) = store
+                    .update(|report, disk| merge_rows(report, rows, |name| disk.resolve(name)))
+                {
+                    graded_now.extend(names);
+                }
             }
+        })
+        .await;
 
-            if batch_idx + 1 < total_batches {
-                sleep(Duration::from_millis(llm_cfg.rate_limit_ms)).await;
-            }
+        // Before the videos: best picks only depend on the photos' grades.
+        if !graded_now.is_empty() {
+            store.update(|report, disk| pick_best(report, &disk.dir, &graded_now, &grading));
+            info!("📊 Grades report: {}", store.path.display());
         }
     }
 
+    // Only photos are graded; videos are tagged but never reported or copied.
     if !video_files.is_empty() {
         info!(
             "🎬 Tagging {} video(s) at {} fps.",
             video_files.len(),
             video_fps
         );
-        process_videos(&client, &llm_cfg, &extras, &video_files, video_fps).await;
+        failures += process_videos(&client, &llm_cfg, &extras, &video_files, video_fps).await;
     }
 
+    if failures > 0 {
+        // A non-zero exit lets callers such as the digiKam wrapper notice.
+        warn_!(
+            "⚠️  Done, but {} file(s) could not be tagged — see the messages above.",
+            failures
+        );
+        std::process::exit(1);
+    }
     info!("🎉 Done.");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::to_sentence_case;
+    use super::*;
+    use serde_json::json;
 
     #[test]
     fn sentence_case_flattens_title_case() {
@@ -1073,5 +2288,650 @@ mod tests {
             to_sentence_case("A sign reads \"open.\" A man walks in."),
             "A sign reads \"open.\" A man walks in."
         );
+    }
+
+    #[test]
+    fn grades_accept_numbers_and_strings_and_clamp_to_scale() {
+        assert_eq!(grade_from_value(&json!(7)), Some(7));
+        assert_eq!(grade_from_value(&json!(7.4)), Some(7));
+        assert_eq!(grade_from_value(&json!(7.6)), Some(8));
+        assert_eq!(grade_from_value(&json!(" 8 ")), Some(8));
+        assert_eq!(grade_from_value(&json!(0)), Some(1));
+        assert_eq!(grade_from_value(&json!(14)), Some(10));
+        assert_eq!(grade_from_value(&json!("n/a")), None);
+        assert_eq!(grade_from_value(&json!(null)), None);
+        assert_eq!(grade_from_value(&json!(true)), None);
+    }
+
+    #[test]
+    fn missing_or_malformed_grades_never_fail_the_batch() {
+        let batch = parse_batch(
+            r#"{"results": [
+                {"title": "A", "description": "B", "keywords": ["x"],
+                 "grades": {"editing_quality": 6, "technical_quality": "7",
+                            "commercial_cleanliness": 9.2, "market_demand": "high", "overall": 7},
+                 "grade_notes": "sharp; generic subject"},
+                {"title": "C", "description": "D", "keywords": [], "grades": "excellent",
+                 "grade_notes": ["slight noise", "logo on mug"]},
+                {"title": "E", "description": "F", "keywords": [], "grade_notes": {"noise": 1}},
+                {"title": "G", "description": "H", "keywords": [], "grade_notes": 5}
+            ]}"#,
+        )
+        .expect("batch parses despite bad grades");
+        assert_eq!(
+            batch[0].grades,
+            Some(Grades {
+                editing_quality: Some(6),
+                technical_quality: Some(7),
+                commercial_cleanliness: Some(9),
+                market_demand: None,
+                overall: Some(7),
+            })
+        );
+        assert_eq!(
+            batch[0].grade_notes.as_deref(),
+            Some("sharp; generic subject")
+        );
+        assert_eq!(batch[1].grades, None);
+        assert_eq!(
+            batch[1].grade_notes.as_deref(),
+            Some("slight noise; logo on mug")
+        );
+        assert_eq!(batch[2].grades, None);
+        assert_eq!(batch[2].grade_notes, None);
+        assert_eq!(batch[3].grade_notes, None);
+    }
+
+    fn row(name: &str, overall: Option<u8>) -> GradeRow {
+        GradeRow::new(
+            Path::new(name),
+            Grades {
+                overall,
+                ..Grades::default()
+            },
+            String::new(),
+        )
+    }
+
+    // A fresh, empty directory for one test.
+    fn test_dir(tag: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("phototag_{}_{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn merge_rows_keys_by_on_disk_name_and_keeps_user_columns() {
+        let mut b = row("b.jpg", Some(6));
+        b.copied = "2026-09-01 10:00".to_string();
+        b.extra = vec!["yes".to_string()];
+        let mut report = Report {
+            extra_headers: vec!["uploaded".to_string()],
+            rows: vec![
+                row("a.jpg", Some(5)),
+                b,
+                row("gone.jpg", Some(9)),
+                row("A.JPG", Some(3)),
+            ],
+        };
+        // A case-insensitive volume: every spelling resolves to the file's name on disk.
+        let on_disk = |name: &str| {
+            ["a.jpg", "b.jpg", "c.jpg"]
+                .into_iter()
+                .find(|n| n.eq_ignore_ascii_case(name))
+                .map(String::from)
+        };
+        let fresh = merge_rows(
+            &mut report,
+            vec![row("c.jpg", None), row("B.JPG", Some(8))],
+            on_disk,
+        );
+        assert_eq!(fresh, vec!["c.jpg", "b.jpg"]);
+        let summary: Vec<(&str, Option<u8>, &str, &[String])> = report
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.name.as_str(),
+                    r.grades.overall,
+                    r.copied.as_str(),
+                    r.extra.as_slice(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("a.jpg", Some(5), "", &[][..]),
+                (
+                    "b.jpg",
+                    Some(8),
+                    "2026-09-01 10:00",
+                    &["yes".to_string()][..]
+                ),
+                ("c.jpg", None, "", &[][..]),
+            ]
+        );
+    }
+
+    #[test]
+    fn subtotal_sums_the_available_subgrades() {
+        let r = GradeRow::new(
+            Path::new("a.jpg"),
+            Grades {
+                editing_quality: Some(6),
+                technical_quality: Some(7),
+                commercial_cleanliness: None,
+                market_demand: Some(5),
+                overall: Some(9),
+            },
+            String::new(),
+        );
+        assert_eq!(r.subtotal(), 18);
+    }
+
+    #[test]
+    fn report_round_trips_through_csv_even_with_a_bom() {
+        let mut first = GradeRow::new(
+            Path::new("shoot/a, b.jpg"),
+            Grades {
+                editing_quality: Some(6),
+                overall: Some(7),
+                ..Grades::default()
+            },
+            "shadow noise; \"logo\" on mug".to_string(),
+        );
+        first.fingerprint = Some(Fingerprint {
+            frame: 0x0123_4567_89ab_cdef,
+            subject: u64::MAX,
+        });
+        first.copied = "2026-09-28 16:30".to_string();
+        first.extra = vec!["yes".to_string()];
+        let mut second = row("c.jpg", None);
+        second.extra = vec![String::new()];
+        let report = Report {
+            extra_headers: vec!["Uploaded to Adobe".to_string()],
+            rows: vec![first, second],
+        };
+
+        let text = String::from_utf8(render_report(&report).unwrap()).unwrap();
+        assert!(text.starts_with(
+            "name,index,editing_quality,technical_quality,commercial_cleanliness,market_demand,overall,notes,fingerprint,copied,Uploaded to Adobe\n"
+        ));
+        let (parsed, problems) = parse_report(&format!("\u{feff}{}", text));
+        assert!(problems.is_empty(), "{:?}", problems);
+        assert_eq!(parsed, report);
+    }
+
+    #[test]
+    fn report_parsing_tolerates_spreadsheet_edits() {
+        // Re-cased and padded headers, reordered columns, a user-added column, a
+        // row with its trailing cells trimmed, and a grade typed by hand.
+        let (report, problems) = parse_report(
+            " Name ,Overall,Status,Editing Quality,technical_quality,commercial_cleanliness,market_demand,notes\n\
+             a.jpg,8,uploaded,6,7,8,9,sharp\n\
+             b.jpg,7\n\
+             c.jpg,8+,,,,,,\n",
+        );
+        assert_eq!(report.extra_headers, vec!["Status"]);
+        let grades: Vec<(&str, Option<u8>, Option<u8>)> = report
+            .rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.grades.overall, r.grades.editing_quality))
+            .collect();
+        assert_eq!(
+            grades,
+            vec![
+                ("a.jpg", Some(8), Some(6)),
+                ("b.jpg", Some(7), None),
+                ("c.jpg", None, None),
+            ]
+        );
+        assert_eq!(report.rows[0].notes, "sharp");
+        assert_eq!(report.rows[0].extra, vec!["uploaded"]);
+        assert_eq!(report.rows[1].extra, vec![""]);
+        assert_eq!(problems, vec!["c.jpg's overall \"8+\" is unreadable"]);
+    }
+
+    #[test]
+    fn report_missing_its_columns_is_flagged() {
+        let (report, problems) = parse_report("name;index;overall\na.jpg;1;7\n");
+        assert!(report.rows.is_empty());
+        assert_eq!(problems, vec!["it has no `name` column"]);
+
+        let (report, problems) = parse_report("name,Overall grade\na.jpg,7\n");
+        assert_eq!(report.extra_headers, vec!["Overall grade"]);
+        assert_eq!(report.rows[0].extra, vec!["7"]);
+        assert!(problems.contains(&"it has no `overall` column".to_string()));
+    }
+
+    #[test]
+    fn report_store_repairs_a_non_utf8_report_and_keeps_a_backup() {
+        let dir = test_dir("repair");
+        let mut original = b"name,index,overall,notes\na.jpg,1,8,caf".to_vec();
+        original.push(0xE9); // "é" as Excel's legacy CSV encodings write it
+        original.extend(b"\nb.jpg,2,5,\n");
+        fs::write(dir.join("stock_grades.csv"), &original).unwrap();
+
+        let mut store = ReportStore::new(&dir, "stock_grades.csv");
+        let names = store.update(|report, _| {
+            report
+                .rows
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(names, Some(vec!["a.jpg".to_string(), "b.jpg".to_string()]));
+        let rewritten = fs::read_to_string(dir.join("stock_grades.csv")).expect("now UTF-8");
+        assert!(
+            rewritten.contains("a.jpg,1,,,,,8,caf\u{fffd},,\n"),
+            "{}",
+            rewritten
+        );
+        let backups: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "bak"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(&backups[0]).unwrap(), original);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_store_leaves_an_unreadable_report_untouched() {
+        let dir = test_dir("unreadable");
+        fs::create_dir(dir.join("stock_grades.csv")).unwrap(); // can't be read as a file
+        fs::write(dir.join("a.jpg"), b"jpeg").unwrap();
+
+        let mut store = ReportStore::new(&dir, "stock_grades.csv");
+        let merged = store.update(|report, disk| {
+            merge_rows(report, vec![row("a.jpg", Some(8))], |n| disk.resolve(n))
+        });
+        assert_eq!(merged, Some(vec!["a.jpg".to_string()]));
+        assert!(dir.join("stock_grades.csv").is_dir());
+        let diverted: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("stock_grades.csv.unmerged-"))
+            .collect();
+        assert_eq!(diverted.len(), 1);
+        let text = fs::read_to_string(dir.join(&diverted[0])).unwrap();
+        assert!(text.contains("a.jpg,1,,,,,8,,,\n"), "{}", text);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dir_index_resolves_only_files_in_the_folder() {
+        let dir = test_dir("index");
+        fs::write(dir.join("P1000123.JPG"), b"jpeg").unwrap();
+        fs::create_dir(dir.join("best_for_stock")).unwrap();
+        let index = DirIndex::scan(&dir).unwrap();
+        assert_eq!(
+            index.resolve("P1000123.JPG").as_deref(),
+            Some("P1000123.JPG")
+        );
+        assert_eq!(index.resolve("missing.jpg"), None);
+        assert_eq!(index.resolve("best_for_stock"), None);
+        // Another spelling reaches the file only on a case-insensitive volume.
+        if dir.join("p1000123.jpg").is_file() {
+            assert_eq!(
+                index.resolve("p1000123.jpg").as_deref(),
+                Some("P1000123.JPG")
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_dir_is_the_folder_of_a_single_file() {
+        assert_eq!(
+            report_dir(Path::new("shoot/IMG_1.jpg")),
+            PathBuf::from("shoot")
+        );
+        assert_eq!(report_dir(Path::new("IMG_1.jpg")), PathBuf::from("."));
+    }
+
+    #[test]
+    fn grading_folders_must_be_plain_names() {
+        for ok in [
+            "best_for_stock",
+            "best picks",
+            "best_for_stock/",
+            "grades.csv",
+        ] {
+            assert!(is_plain_name(ok), "{}", ok);
+        }
+        for bad in [
+            "/Users/me/Stock",
+            "../best",
+            "shoot/best",
+            "~/best",
+            "~",
+            ".",
+            "..",
+        ] {
+            assert!(!is_plain_name(bad), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn digikam_temp_files_are_recognised() {
+        assert!(is_digikam_temp_file(Path::new(
+            "/album/BatchTool-EpEjEz-9e1c7a12.digikamtempfile.JPG"
+        )));
+        assert!(!is_digikam_temp_file(Path::new("/album/P1000123.JPG")));
+    }
+
+    fn pick(
+        name: &str,
+        overall: u8,
+        subtotal: u16,
+        fingerprint: Option<Fingerprint>,
+    ) -> BestCandidate {
+        BestCandidate {
+            name: name.to_string(),
+            overall,
+            subtotal,
+            fingerprint,
+        }
+    }
+
+    fn fp(bits: u64) -> Option<Fingerprint> {
+        Some(Fingerprint {
+            frame: bits,
+            subject: bits,
+        })
+    }
+
+    #[test]
+    fn select_unique_keeps_the_best_of_each_near_duplicate_group() {
+        let base = 0xF0F0_F0F0_F0F0_F0F0u64;
+        let (kept, skipped) = select_unique(
+            vec![
+                pick("burst_2.jpg", 7, 28, fp(base ^ 0b111)), // 3 bits from burst_1
+                pick("burst_1.jpg", 8, 30, fp(base)),
+                pick("other.jpg", 7, 25, fp(!base)), // 64 bits away
+                pick("undecodable.jpg", 7, 20, None), // no fingerprint: kept
+            ],
+            10,
+        );
+        let kept: Vec<&str> = kept.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(kept, vec!["burst_1.jpg", "other.jpg", "undecodable.jpg"]);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].candidate.name, "burst_2.jpg");
+        assert_eq!(skipped[0].duplicate_of, "burst_1.jpg");
+        assert_eq!(skipped[0].distance, 3);
+    }
+
+    #[test]
+    fn select_unique_breaks_ties_by_subgrades_then_name() {
+        let same = fp(42);
+        let names = |picks: &[BestCandidate]| -> Vec<String> {
+            picks.iter().map(|p| p.name.clone()).collect()
+        };
+
+        let (kept, _) = select_unique(
+            vec![pick("a.jpg", 7, 20, same), pick("z.jpg", 7, 24, same)],
+            0,
+        );
+        assert_eq!(names(&kept), vec!["z.jpg"]);
+
+        let (kept, _) = select_unique(
+            vec![pick("b.jpg", 7, 20, same), pick("a.jpg", 7, 20, same)],
+            0,
+        );
+        assert_eq!(names(&kept), vec!["a.jpg"]);
+    }
+
+    #[test]
+    fn near_duplicates_need_both_views_to_match() {
+        let a = Fingerprint {
+            frame: 0,
+            subject: 0,
+        };
+        let b = Fingerprint {
+            frame: 0b11,
+            subject: 0xFFFF,
+        };
+        assert_eq!(a.distance(&b), 16);
+    }
+
+    #[test]
+    fn fingerprint_round_trips_through_its_stored_form() {
+        let fp = Fingerprint {
+            frame: 0x0123_4567_89ab_cdef,
+            subject: 42,
+        };
+        assert_eq!(fp.to_string(), "p1:0123456789abcdef000000000000002a");
+        assert_eq!(Fingerprint::parse(&fp.to_string()), Some(fp));
+        assert_eq!(Fingerprint::parse("0123456789abcdef000000000000002a"), None);
+        assert_eq!(Fingerprint::parse(&format!("p1:{}", "é".repeat(16))), None);
+        assert_eq!(Fingerprint::parse(""), None);
+    }
+
+    type Shape = fn(f32, f32) -> bool;
+
+    // A textured grey product lit from the left, a little off-centre on a
+    // seamless white backdrop. (Perfectly clean, symmetric renders are
+    // degenerate for a DCT hash: most of their coefficients are zero.)
+    fn studio_shot(shape: Shape, shift: f32, light: f32) -> image::DynamicImage {
+        use image::{DynamicImage, Rgb, RgbImage};
+        let (w, h) = (600u32, 400u32);
+        DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
+            let u = (x as f32 / w as f32 - 0.46 - shift) * 1.5;
+            let v = y as f32 / h as f32 - 0.53 - shift / 2.0;
+            if shape(u, v) {
+                let texture = 25.0 * (17.0 * u + 5.0 * v).sin() * (11.0 * v).cos();
+                let luma = (90.0 + 80.0 * (u + 0.5) + texture) * light;
+                Rgb([luma.clamp(0.0, 255.0) as u8; 3])
+            } else {
+                Rgb([255, 255, 255])
+            }
+        }))
+    }
+
+    fn ball(u: f32, v: f32) -> bool {
+        u * u + v * v < 0.04
+    }
+    fn bottle(u: f32, v: f32) -> bool {
+        u.abs() < 0.07 && v.abs() < 0.35
+    }
+    fn slab(u: f32, v: f32) -> bool {
+        u.abs() < 0.3 && v.abs() < 0.12
+    }
+    fn egg(u: f32, v: f32) -> bool {
+        let (du, dv) = ((u + 0.25) / 0.1, v / 0.16);
+        du * du + dv * dv < 1.0
+    }
+
+    #[test]
+    fn fingerprint_separates_different_products_on_one_backdrop() {
+        let shapes: [Shape; 4] = [ball, bottle, slab, egg];
+        let shots: Vec<Fingerprint> = shapes
+            .iter()
+            .map(|&shape| fingerprint_image(&studio_shot(shape, 0.0, 1.0)))
+            .collect();
+        for i in 0..shots.len() {
+            for j in i + 1..shots.len() {
+                let distance = shots[i].distance(&shots[j]);
+                assert!(
+                    distance > 10,
+                    "products {} and {} are {} apart",
+                    i,
+                    j,
+                    distance
+                );
+            }
+            // The next frame of a burst: nudged and a touch brighter.
+            let burst = fingerprint_image(&studio_shot(shapes[i], 0.01, 1.03));
+            let distance = shots[i].distance(&burst);
+            assert!(
+                distance <= 10,
+                "burst of product {} is {} apart",
+                i,
+                distance
+            );
+        }
+    }
+
+    #[test]
+    fn fingerprint_matches_near_duplicates_and_separates_different_images() {
+        use image::{DynamicImage, Rgb, RgbImage};
+
+        // Smooth random terrain, for the broad spectrum of a real photo (a few
+        // sinusoids or a ramp are degenerate cases for a DCT hash).
+        let scene = |mirror: bool| {
+            let mut state = 0x2545_F491_4F6C_DD1Du64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % 256) as f32
+            };
+            let coarse: Vec<f32> = (0..9 * 7).map(|_| next()).collect();
+            let fine: Vec<f32> = (0..33 * 25).map(|_| next()).collect();
+            RgbImage::from_fn(320, 240, move |x, y| {
+                let x = if mirror { 319 - x } else { x };
+                let sample = |grid: &[f32], width: usize, cell: f32| {
+                    let (fx, fy) = (x as f32 / cell, y as f32 / cell);
+                    let (x0, y0) = (fx as usize, fy as usize);
+                    let at = |i: usize, j: usize| grid[j * width + i];
+                    let top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * fx.fract();
+                    let bottom =
+                        at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * fx.fract();
+                    top + (bottom - top) * fy.fract()
+                };
+                let luma = 0.7 * sample(&coarse, 9, 40.0) + 0.3 * sample(&fine, 33, 10.0);
+                Rgb([luma as u8; 3])
+            })
+        };
+        let base = scene(false);
+        let mut touched = base.clone();
+        for y in 100..116 {
+            for x in 150..166 {
+                touched.put_pixel(x, y, Rgb([0, 0, 0]));
+            }
+        }
+
+        let base_fp = fingerprint_image(&DynamicImage::ImageRgb8(base));
+        let touched_fp = fingerprint_image(&DynamicImage::ImageRgb8(touched));
+        let mirrored_fp = fingerprint_image(&DynamicImage::ImageRgb8(scene(true)));
+        let near = base_fp.distance(&touched_fp);
+        let far = base_fp.distance(&mirrored_fp);
+        assert!(
+            near <= 10,
+            "a small local change stays a near-duplicate ({})",
+            near
+        );
+        assert!(
+            far > 10,
+            "a different image is not a near-duplicate ({})",
+            far
+        );
+    }
+
+    #[test]
+    fn fingerprint_reads_upper_case_camera_extensions() {
+        use image::{ImageFormat, Rgb, RgbImage};
+
+        let dir = test_dir("fp");
+        let path = dir.join("P1000123.JPG");
+        let img = RgbImage::from_fn(64, 48, |x, y| Rgb([(x * 4) as u8, (y * 5) as u8, 128]));
+        img.save_with_format(&path, ImageFormat::Jpeg).unwrap();
+
+        let result = fingerprint(&path);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(result.is_ok(), "fingerprint failed: {:?}", result.err());
+    }
+
+    fn grading(min_grade: u8) -> GradingConfig {
+        GradingConfig {
+            report_file: "stock_grades.csv".to_string(),
+            best_dir: "best".to_string(),
+            min_grade,
+            max_distance: 10,
+        }
+    }
+
+    #[test]
+    fn pick_best_copies_new_picks_and_leaves_existing_or_removed_copies() {
+        use image::ImageFormat;
+
+        let dir = test_dir("pick");
+        let best = dir.join("best");
+        fs::create_dir_all(&best).unwrap();
+        let shapes: [(&str, Shape); 5] = [
+            ("new.jpg", ball),
+            ("old.jpg", bottle),
+            ("removed.jpg", slab),
+            ("earlier.jpg", egg),
+            ("low.jpg", egg),
+        ];
+        for (name, shape) in shapes {
+            studio_shot(shape, 0.0, 1.0)
+                .save_with_format(dir.join(name), ImageFormat::Jpeg)
+                .unwrap();
+        }
+        // Graded in an earlier run; its copy has since been removed.
+        let mut old = row("old.jpg", Some(9));
+        old.copied = "2026-09-01 10:00".to_string();
+        // Graded again now, but the user removed its copy after the last run.
+        let mut removed = row("removed.jpg", Some(8));
+        removed.copied = "2026-09-01 10:00".to_string();
+        // Graded earlier (say by an interrupted run) and never copied.
+        let earlier = row("earlier.jpg", Some(7));
+        // No longer qualifies, but its old copy is still there.
+        fs::copy(dir.join("low.jpg"), best.join("low.jpg")).unwrap();
+        let mut report = Report {
+            extra_headers: Vec::new(),
+            rows: vec![
+                row("new.jpg", Some(8)),
+                old,
+                removed,
+                earlier,
+                row("low.jpg", Some(3)),
+            ],
+        };
+        let graded_now: HashSet<String> = ["new.jpg", "removed.jpg", "low.jpg"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let picks = pick_best(&mut report, &dir, &graded_now, &grading(6));
+        assert_eq!(picks.copied, vec!["new.jpg", "earlier.jpg"]);
+        assert_eq!(picks.not_recopied, vec!["removed.jpg"]);
+        assert_eq!(picks.stale, vec!["low.jpg"]);
+        assert!(best.join("new.jpg").is_file() && best.join("earlier.jpg").is_file());
+        assert!(!best.join("old.jpg").exists() && !best.join("removed.jpg").exists());
+        let copied: Vec<bool> = report
+            .rows
+            .iter()
+            .map(|r| r.copied.starts_with("20"))
+            .collect();
+        assert_eq!(copied, vec![true, true, true, true, false]);
+        assert!(report.rows[..4].iter().all(|r| r.fingerprint.is_some()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_copies_are_reported_even_when_nothing_qualifies() {
+        let dir = test_dir("stale");
+        fs::create_dir_all(dir.join("best")).unwrap();
+        fs::write(dir.join("a.jpg"), b"jpeg").unwrap();
+        fs::write(dir.join("best").join("a.jpg"), b"jpeg").unwrap();
+        let mut report = Report {
+            extra_headers: Vec::new(),
+            rows: vec![row("a.jpg", Some(7))],
+        };
+        let graded_now: HashSet<String> = HashSet::from(["a.jpg".to_string()]);
+
+        let picks = pick_best(&mut report, &dir, &graded_now, &grading(8));
+        assert!(picks.copied.is_empty());
+        assert_eq!(picks.stale, vec!["a.jpg"]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
