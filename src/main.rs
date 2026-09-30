@@ -269,12 +269,13 @@ fn strip_markdown_fence(raw: &str) -> &str {
 // prompts below.
 const METADATA_RULES: &str = "1. A catchy, highly relevant Title of 5-7 words that reads as ONE coherent, grammatical sentence: the words must connect into a natural, readable phrase describing the scene, NOT a list of loosely related keywords. The title must never exceed 200 characters. Write it to drive sales: lead with the terms commercial buyers actually search for and the concept the image sells.\n\
      2. A detailed Description/Caption (1-2 sentences describing the scene), also written to drive sales: highlight the commercial concepts and use cases buyers search for, while staying factual to what is visible.\n\
-     3. Up to 25 keywords strictly sorted in ORDER OF PRECEDENCE (the most important, visible subjects must come first, followed by broader categories, with abstract moods at the very end).\n\
+     3. Between 25 and 40 keywords strictly sorted in ORDER OF PRECEDENCE (the most important, visible subjects must come first, followed by broader categories, with abstract moods at the very end).\n\
      STRICT RULE FOR KEYWORDS: Only include elements that are directly visible or explicitly factual to the scene. Do not guess locations (e.g., 'Tokyo'), seasons, or industries unless there is undeniable visual proof in the image. Avoid fluff.\n\
      CRITICAL GETTY IMAGES CONSTRAINT: Every keyword must be a single, standalone word or a universally standard two-word term (e.g., 'digital tablet', 'golden retriever'). Avoid descriptive phrases, sentences, or action-statements in the keywords array. Keep them literal, concrete, and distinct.";
 
-// Rule 3's keyword cap, applied after parsing (the model may return more).
-const MAX_KEYWORDS: usize = 25;
+// Rule 3's keyword cap, applied after parsing (the model may return more). Its
+// minimum is only asked for: a shorter list is still written.
+const MAX_KEYWORDS: usize = 40;
 
 // Lowercase everything, then capitalize the first letter of each sentence, so a
 // title or caption reads as sentence case regardless of how the model cased it.
@@ -2509,6 +2510,11 @@ mod tests {
             to_sentence_case("A sign reads \"open.\" A man walks in."),
             "A sign reads \"open.\" A man walks in."
         );
+    }
+
+    #[test]
+    fn prompt_asks_for_the_keyword_cap() {
+        assert!(METADATA_RULES.contains(&format!("and {MAX_KEYWORDS} keywords")));
     }
 
     #[test]

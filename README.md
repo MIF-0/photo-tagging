@@ -1,6 +1,6 @@
 # photo-tagging
 
-A Rust CLI that iterates over JPEG photos and `.mov` videos and uses a Google Gemini vision model to embed a title, caption, and up to 25 keywords — optimized for stock uploads (Shutterstock, Adobe Stock, Pixta, Getty, Pond5). Photos get IPTC + XMP tags; videos get XMP + QuickTime tags (frames are sampled with `ffmpeg` and analyzed as one clip). Photos are also graded for stock potential: the grades go to `stock_grades.csv`, and the best unique photos are copied to `best_for_stock/`.
+A Rust CLI that iterates over JPEG photos and `.mov` videos and uses a Google Gemini vision model to embed a title, caption, and 25 to 40 keywords — optimized for stock uploads (Shutterstock, Adobe Stock, Pixta, Getty, Pond5). Photos get IPTC + XMP tags; videos get XMP + QuickTime tags (frames are sampled with `ffmpeg` and analyzed as one clip). Photos are also graded for stock potential: the grades go to `stock_grades.csv`, and the best unique photos are copied to `best_for_stock/`.
 
 ## Requirements
 
