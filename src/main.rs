@@ -267,11 +267,11 @@ fn strip_markdown_fence(raw: &str) -> &str {
 // The title/description/keyword rules are identical whether we're tagging a
 // still photo or a video's frames, so they live here and are composed into both
 // prompts below.
-const METADATA_RULES: &str = "1. A catchy, highly relevant Title of 5-7 words that reads as ONE coherent, grammatical sentence: the words must connect into a natural, readable phrase describing the scene, NOT a list of loosely related keywords. The title must never exceed 200 characters. Write it to drive sales: lead with the terms commercial buyers actually search for and the concept the image sells.\n\
-     2. A detailed Description/Caption (1-2 sentences describing the scene), also written to drive sales: highlight the commercial concepts and use cases buyers search for, while staying factual to what is visible.\n\
-     3. Between 25 and 40 keywords strictly sorted in ORDER OF PRECEDENCE (the most important, visible subjects must come first, followed by broader categories, with abstract moods at the very end).\n\
-     STRICT RULE FOR KEYWORDS: Only include elements that are directly visible or explicitly factual to the scene. Do not guess locations (e.g., 'Tokyo'), seasons, or industries unless there is undeniable visual proof in the image. Avoid fluff.\n\
-     CRITICAL GETTY IMAGES CONSTRAINT: Every keyword must be a single, standalone word or a universally standard two-word term (e.g., 'digital tablet', 'golden retriever'). Avoid descriptive phrases, sentences, or action-statements in the keywords array. Keep them literal, concrete, and distinct.";
+const METADATA_RULES: &str = "1. Title / Caption: A search-optimized commercial title (maximum 150-200 characters) structured as a single, grammatically coherent sentence. The words must be strictly arranged in descending order of commercial search demand—front-loading the highest-intent buyer keywords and primary subjects first, followed by contextual modifiers. It must satisfy strict search relevance thresholds and eliminate 'poor discovery' flags while remaining readable.\n\
+     2. Description / Additional Info: A comprehensive, factual description of 1-2 sentences detailing the scene's context, physical attributes, materials, and explicit commercial use cases or editorial applications. It must provide sufficient semantic depth to maximize indexing weight and meet platform metadata quality standards.\n\
+     3. Keywords (25 to 40 items): Strictly structured in descending ORDER OF PRECEDENCE — starting with exact, highly specific visible subjects and materials, moving to broader categorical descriptors, and ending with abstract conceptual attributes.\n\
+     - STRICT VISIBILITY RULE: Strictly limit tags to indisputably visible elements. Do not extrapolate unverified locations, brands, temporal seasons, or industries.\n\
+     - GETTY / ALAMY COMPLIANCE: Every keyword must be an individual standalone noun/adjective or a standardized, industry-accepted two-word compound term (e.g., 'wooden shelf', 'interior design'). Prohibit descriptive phrases, action clauses, or subjective modifiers.";
 
 // Rule 3's keyword cap, applied after parsing (the model may return more). Its
 // minimum is only asked for: a shorter list is still written.
@@ -2514,7 +2514,7 @@ mod tests {
 
     #[test]
     fn prompt_asks_for_the_keyword_cap() {
-        assert!(METADATA_RULES.contains(&format!("and {MAX_KEYWORDS} keywords")));
+        assert!(METADATA_RULES.contains(&format!("to {MAX_KEYWORDS} items")));
     }
 
     #[test]
